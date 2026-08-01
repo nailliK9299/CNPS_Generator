@@ -28,14 +28,15 @@ jobs:
       run: |
         playwright install chromium
 
-    - name: Build macOS App Bundle
+    - name: Build macOS App
       run: |
-        pyinstaller build_mac.spec --noconfirm
+        python build_mac.py
 
-    - name: Zip macOS App
+    - name: Zip macOS Bundle
       run: |
         cd dist
-        zip -r CNPS_Generator_macOS.zip CNPS_Generator.app
+        zip -r CNPS_Generator_macOS.zip CNPS_Generator
+        ls -lh
 
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
