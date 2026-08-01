@@ -31,12 +31,17 @@ datas = [
     ('src/core/Readability.js', 'core'),
 ]
 
-# Tự động tìm thư mục Chromium của Playwright trên macOS nếu có
-pw_cache = Path.home() / "Library/Caches/ms-playwright"
-if pw_cache.exists():
-    for chromium_dir in pw_cache.glob("chromium-*"):
-        if chromium_dir.is_dir():
-            datas.append((str(chromium_dir), f"chromium/{chromium_dir.name}"))
+# Tự động tìm thư mục Chromium của Playwright trên macOS
+possible_caches = [
+    Path.home() / "Library/Caches/ms-playwright",
+    Path.home() / ".cache/ms-playwright",
+]
+
+for cache_dir in possible_caches:
+    if cache_dir.exists():
+        for chromium_dir in cache_dir.glob("chromium-*"):
+            if chromium_dir.is_dir():
+                datas.append((str(chromium_dir), f"chromium/{chromium_dir.name}"))
 
 a = Analysis(
     ['src/main.py'],
