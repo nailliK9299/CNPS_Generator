@@ -30,6 +30,7 @@ ENV/
 output/
 output_test/
 *.docx
+!data/CNPS template.docx
 *.png
 *.jpg
 *.log
