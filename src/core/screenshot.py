@@ -189,6 +189,7 @@ async def _capture_article(
             # 3. Dọn giao diện
             cb("Đang dọn quảng cáo, popup...")
             await _cleanup_page(page)
+            await _fix_relative_dates(page, url)
             await page.wait_for_timeout(POST_CLEANUP_WAIT_MS)
             
             # 4. Xác định vùng nội dung
@@ -292,6 +293,64 @@ async def _cleanup_page(page: Page) -> None:
             const style = getComputedStyle(el);
             if (style.position === 'fixed' || style.position === 'sticky') {
                 el.style.setProperty('position', 'static', 'important');
+            }
+        }
+    }
+    """)
+
+
+async def _fix_relative_dates(page: Page, url: str) -> None:
+    """
+    Chuẩn hoá các chuỗi thời gian tương đối (vd: '6 tháng trước', '2 giờ trước')
+    về định dạng dd/mm/yyyy HH:mm dựa vào attribute datetime/title hoặc ISO format.
+    """
+    await page.evaluate("""
+    () => {
+        function formatDate(dt) {
+            const dd = String(dt.getDate()).padStart(2, '0');
+            const mm = String(dt.getMonth() + 1).padStart(2, '0');
+            const yyyy = dt.getFullYear();
+            const hh = String(dt.getHours()).padStart(2, '0');
+            const mi = String(dt.getMinutes()).padStart(2, '0');
+            return `${dd}/${mm}/${yyyy} ${hh}:${mi}`;
+        }
+
+        // 1. Tất cả thẻ <time> có attribute datetime hoặc title
+        const timeElements = document.querySelectorAll('time[datetime], time[title], [itemprop="datePublished"]');
+        for (const el of timeElements) {
+            const dtStr = el.getAttribute('datetime') || el.getAttribute('title');
+            if (dtStr) {
+                const dt = new Date(dtStr);
+                if (!isNaN(dt.getTime())) {
+                    el.textContent = formatDate(dt);
+                }
+            }
+        }
+
+        // 2. Các phần tử chứa text thời gian tương đối (vd: '6 tháng trước', '10 phút trước')
+        const relativeRegex = /(\\d+)\\s*(giây|phút|giờ|ngày|tuần|tháng|năm)\\s*trước/i;
+        const allCandidates = document.querySelectorAll('span, div, time, p, small, a');
+        for (const el of allCandidates) {
+            if (el.children.length === 0 && relativeRegex.test(el.textContent.trim())) {
+                const dtStr = el.getAttribute('datetime') || el.getAttribute('title') ||
+                              el.parentElement?.getAttribute('datetime') || el.parentElement?.getAttribute('title');
+                if (dtStr) {
+                    const dt = new Date(dtStr);
+                    if (!isNaN(dt.getTime())) {
+                        el.textContent = formatDate(dt);
+                        continue;
+                    }
+                }
+                const closestTime = el.closest('time') || el.parentElement?.querySelector('time');
+                if (closestTime) {
+                    const cDtStr = closestTime.getAttribute('datetime') || closestTime.getAttribute('title');
+                    if (cDtStr) {
+                        const dt = new Date(cDtStr);
+                        if (!isNaN(dt.getTime())) {
+                            el.textContent = formatDate(dt);
+                        }
+                    }
+                }
             }
         }
     }
