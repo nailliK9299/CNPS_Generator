@@ -19,7 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config import (
     APP_TITLE, APP_VERSION, DEFAULT_OUTPUT_DIR, TEMPLATE_PATH,
-    FB_STORAGE_STATE_PATH,
+    FB_STORAGE_STATE_PATH, launch_browser,
 )
 from utils.helpers import (
     generate_output_filename,
@@ -538,7 +538,7 @@ class CNPSApp(tk.Tk):
         
         os.makedirs(os.path.dirname(FB_STORAGE_STATE_PATH), exist_ok=True)
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=False)
+            browser = await launch_browser(p, headless=False)
             context = await browser.new_context(
                 user_agent=(
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "

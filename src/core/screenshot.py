@@ -18,7 +18,7 @@ from config import (
     VIEWPORT_WIDTH, VIEWPORT_HEIGHT, DEVICE_SCALE_FACTOR,
     TARGET_PAGE_HEIGHT_PX, HIDE_ADS_CSS,
     SCROLL_STEP_PX, SCROLL_DELAY_MS, POST_CLEANUP_WAIT_MS,
-    FB_STORAGE_STATE_PATH,
+    FB_STORAGE_STATE_PATH, launch_browser,
 )
 from core.image_processor import smart_paginate
 
@@ -156,7 +156,7 @@ async def _capture_article(
     7. Phân trang thông minh (Pillow)
     """
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+        browser = await launch_browser(p, headless=True)
         try:
             context = await browser.new_context(
                 viewport={"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
@@ -598,7 +598,7 @@ async def _capture_facebook(
     clean_url = _normalize_facebook_url(url)
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+        browser = await launch_browser(p, headless=True)
         try:
             context = await browser.new_context(
                 storage_state=storage_state_path,

@@ -42,8 +42,9 @@ def build_mac():
     print("--> Dang chay PyInstaller...")
     subprocess.run(cmd, check=True)
     
-    # 2. Copy Playwright Chromium browser (bao gồm cả chromium-* và chromium_headless_shell-*)
+    # 2. Copy Playwright Chromium browser (bao gồm cả chromium-*, chromium_headless_shell-*, ffmpeg-*)
     dist_dir = Path("dist/CNPS_Generator")
+    app_bundle = Path("dist/CNPS_Generator.app")
     target_chromium_dir = dist_dir / "chromium"
     target_chromium_dir.mkdir(parents=True, exist_ok=True)
     
@@ -55,15 +56,49 @@ def build_mac():
     found_chromium = False
     for cache_dir in possible_caches:
         if cache_dir.exists():
-            for cdir in cache_dir.glob("chromium*"):
-                if cdir.is_dir():
-                    dest = target_chromium_dir / cdir.name
-                    print(f"--> Copying Playwright Chromium from {cdir} to {dest}")
-                    shutil.copytree(cdir, dest, dirs_exist_ok=True)
-                    found_chromium = True
-                    
+            for pattern in ("chromium*", "ffmpeg*"):
+                for cdir in cache_dir.glob(pattern):
+                    if cdir.is_dir():
+                        dest = target_chromium_dir / cdir.name
+                        print(f"--> Copying Playwright browser {cdir} to {dest} (preserving symlinks)")
+                        if dest.exists():
+                            shutil.rmtree(dest)
+                        shutil.copytree(cdir, dest, symlinks=True)
+                        found_chromium = True
+
+                        # Copy vào bên trong CNPS_Generator.app/Contents/Resources/chromium nếu có .app
+                        if app_bundle.exists():
+                            app_res_chromium = app_bundle / "Contents" / "Resources" / "chromium" / cdir.name
+                            app_res_chromium.parent.mkdir(parents=True, exist_ok=True)
+                            if app_res_chromium.exists():
+                                shutil.rmtree(app_res_chromium)
+                            shutil.copytree(cdir, app_res_chromium, symlinks=True)
+                        
     if not found_chromium:
         print("⚠️ Warning: Playwright Chromium cache directory not found.")
+
+    # 3. Copy CNPS_Generator.app vào trong dist/CNPS_Generator để người dùng Mac mở trực tiếp .app
+    if app_bundle.exists():
+        dest_app = dist_dir / "CNPS_Generator.app"
+        if dest_app.exists():
+            shutil.rmtree(dest_app)
+        shutil.copytree(app_bundle, dest_app, symlinks=True)
+
+        # Tạo script 1-click mở ứng dụng lần đầu (tự gỡ chặn Gatekeeper com.apple.quarantine)
+        launcher_script = dist_dir / "Mo_Ung_Dung_Mac.command"
+        launcher_script.write_text(
+            "#!/bin/bash\n"
+            "DIR=\"$(cd \"$(dirname \"$0\")\" && pwd)\"\n"
+            "xattr -cr \"$DIR\" 2>/dev/null || true\n"
+            "chmod -R +x \"$DIR/CNPS_Generator.app/Contents/MacOS\" \"$DIR/CNPS_Generator\" 2>/dev/null || true\n"
+            "open \"$DIR/CNPS_Generator.app\"\n",
+            encoding="utf-8",
+        )
+        os.chmod(launcher_script, 0o755)
+
+        # Ký ad-hoc (codesign) để chạy mượt trên chip Apple Silicon (M1/M2/M3/M4)
+        subprocess.run(["codesign", "--force", "--deep", "--sign", "-", str(dest_app)], check=False)
+    subprocess.run(["codesign", "--force", "--deep", "--sign", "-", str(dist_dir / "CNPS_Generator")], check=False)
         
     print("==========================================")
     print("✅ HOÀN THÀNH ĐÓNG GÓI MACOS THÀNH CÔNG!")

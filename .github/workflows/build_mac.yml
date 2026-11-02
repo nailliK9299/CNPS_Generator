@@ -35,7 +35,7 @@ jobs:
     - name: Zip macOS Bundle
       run: |
         cd dist
-        zip -r CNPS_Generator_macOS.zip CNPS_Generator
+        zip -r -y CNPS_Generator_macOS.zip CNPS_Generator
         ls -lh
 
     - name: Upload Artifact

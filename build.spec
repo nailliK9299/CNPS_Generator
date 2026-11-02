@@ -12,6 +12,7 @@ block_cipher = None
 # Collect hidden imports & data files
 hiddenimports = [
     'docx',
+    'openpyxl',
     'PIL',
     'PIL.Image',
     'numpy',
