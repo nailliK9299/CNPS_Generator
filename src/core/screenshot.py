@@ -172,50 +172,122 @@ async def _capture_article(
             # 1. Navigate
             cb("Đang mở trang...")
             try:
-                await page.goto(url, wait_until="networkidle", timeout=30_000)
+                await page.goto(url, wait_until="domcontentloaded", timeout=25_000)
             except Exception as e:
-                # Thử lại với wait_until="domcontentloaded" nếu networkidle timeout
-                logger.warning(f"networkidle timeout, thử domcontentloaded: {e}")
-                await page.goto(url, wait_until="domcontentloaded", timeout=15_000)
+                logger.warning(f"domcontentloaded timeout, thử commit: {e}")
+                await page.goto(url, wait_until="commit", timeout=15_000)
+                await page.wait_for_timeout(2000)
+
+            # Chờ ngắn networkidle (tối đa 3.5s) để ảnh/font tải thêm nhưng không bị treo bởi quảng cáo
+            try:
+                await page.wait_for_load_state("networkidle", timeout=3_500)
+            except Exception:
+                pass
             
             # Kiểm tra trang 404/lỗi
-            if page.url.endswith("/404") or "not found" in (await page.title()).lower():
+            try:
+                page_title = (await asyncio.wait_for(page.title(), timeout=3.0)).lower()
+            except Exception:
+                page_title = ""
+            if page.url.endswith("/404") or "not found" in page_title:
                 raise Exception(f"Trang không tồn tại (404): {url}")
             
-            # 2. Auto-scroll
+            # 2. Ước lượng sơ bộ đáy bài viết trước khi scroll để tránh cuộn vào vùng infinite-scroll cuối trang
+            try:
+                initial_bounds = await asyncio.wait_for(_detect_content_bounds(page), timeout=5.0)
+            except Exception:
+                initial_bounds = None
+            max_scroll_px = (int(initial_bounds["bottom"]) + 600) if initial_bounds else 6000
+            max_scroll_px = max(2500, min(max_scroll_px, 10000))
+
+            # Auto-scroll từng bước từ Python (có giới hạn chiều cao bài viết để không kích hoạt infinite-scroll)
             cb("Đang scroll để tải nội dung...")
-            await _auto_scroll(page)
+            await _auto_scroll(page, max_scroll_px=max_scroll_px)
             
             # 3. Dọn giao diện
             cb("Đang dọn quảng cáo, popup...")
-            await _cleanup_page(page)
-            await _fix_relative_dates(page, url)
+            try:
+                await asyncio.wait_for(_cleanup_page(page), timeout=8.0)
+            except Exception as e:
+                logger.warning(f"_cleanup_page timeout/error: {e}")
+            try:
+                await asyncio.wait_for(_fix_relative_dates(page, url), timeout=5.0)
+            except Exception as e:
+                logger.warning(f"_fix_relative_dates timeout/error: {e}")
             await page.wait_for_timeout(POST_CLEANUP_WAIT_MS)
             
-            # 4. Xác định vùng nội dung
+            # 4. Xác định vùng nội dung chính xác sau khi lazy-load ảnh
             cb("Đang xác định vùng nội dung bài viết...")
-            content_bounds = await _detect_content_bounds(page)
+            try:
+                content_bounds = await asyncio.wait_for(_detect_content_bounds(page), timeout=10.0)
+            except Exception as e:
+                logger.warning(f"_detect_content_bounds timeout/error: {e}")
+                content_bounds = initial_bounds
             
             if content_bounds is None:
                 logger.warning(f"Không xác định được nội dung — chụp full page: {url}")
                 cb("⚠️ Không tìm được vùng nội dung — chụp toàn trang")
-                # Fallback: chụp full page
-                full_height = await page.evaluate("document.documentElement.scrollHeight")
+                # Fallback: chụp full page (giới hạn chiều cao tối đa 12000px để tránh treo bộ nhớ)
+                try:
+                    full_height = await asyncio.wait_for(
+                        page.evaluate("document.documentElement.scrollHeight"),
+                        timeout=5.0,
+                    )
+                except Exception:
+                    full_height = VIEWPORT_HEIGHT * 4
                 content_bounds = {
                     "top": 0,
-                    "bottom": full_height,
+                    "bottom": min(int(full_height), 12000),
                     "left": 0,
                     "width": VIEWPORT_WIDTH,
                 }
+            else:
+                # Giới hạn chiều cao tối đa 15000px để tránh lỗi quá tải texture khi trang quá dài
+                content_bounds["bottom"] = min(int(content_bounds["bottom"]), 15000)
             
-            # 5. Chụp ảnh full page rồi crop bằng Pillow
+            # 5. Lấy toạ độ khối nội dung con trước khi giới hạn chiều cao trang chụp
+            cb("Đang phân tích cấu trúc trang...")
+            try:
+                block_positions = await asyncio.wait_for(
+                    _get_block_positions(page, content_bounds),
+                    timeout=8.0,
+                )
+            except Exception as e:
+                logger.warning(f"_get_block_positions timeout/error: {e}")
+                block_positions = []
+
+            # 6. Chụp ảnh full page (giới hạn chiều cao DOM nếu trang có phần đuôi quá dài) rồi crop bằng Pillow
             cb("Đang chụp ảnh...")
-            await page.evaluate("window.scrollTo(0, 0)")
+            try:
+                await asyncio.wait_for(page.evaluate("window.scrollTo(0, 0)"), timeout=3.0)
+            except Exception:
+                pass
             await page.wait_for_timeout(300)
             
-            full_screenshot_bytes = await page.screenshot(
-                full_page=True,
-                type="png",
+            capture_height = max(VIEWPORT_HEIGHT, min(int(content_bounds["bottom"]) + 100, 15000))
+            try:
+                await asyncio.wait_for(
+                    page.evaluate(f"""
+                    () => {{
+                        const sh = document.documentElement.scrollHeight || 0;
+                        if (sh > {capture_height + 800}) {{
+                            document.documentElement.style.maxHeight = '{capture_height}px';
+                            document.documentElement.style.overflow = 'hidden';
+                            if (document.body) {{
+                                document.body.style.maxHeight = '{capture_height}px';
+                                document.body.style.overflow = 'hidden';
+                            }}
+                        }}
+                    }}
+                    """),
+                    timeout=3.0,
+                )
+            except Exception:
+                pass
+
+            full_screenshot_bytes = await asyncio.wait_for(
+                page.screenshot(full_page=True, type="png"),
+                timeout=30.0,
             )
             
             # Crop ảnh theo content_bounds (tính bằng CSS px → nhân scale)
@@ -236,10 +308,6 @@ async def _capture_article(
             screenshot_bytes = _buf.getvalue()
             del _full_img, _cropped, _buf
             
-            # 6. Lấy toạ độ khối nội dung con
-            cb("Đang phân tích cấu trúc trang...")
-            block_positions = await _get_block_positions(page, content_bounds)
-            
             # 7. Phân trang thông minh
             cb("Đang phân trang ảnh...")
             page_images = smart_paginate(
@@ -257,27 +325,39 @@ async def _capture_article(
             await browser.close()
 
 
-async def _auto_scroll(page: Page) -> None:
-    """Scroll từ đầu đến cuối trang để kích lazy-load."""
-    await page.evaluate(f"""
-    async () => {{
-        await new Promise((resolve) => {{
-            let totalHeight = 0;
-            const distance = {SCROLL_STEP_PX};
-            const delay = {SCROLL_DELAY_MS};
-            const timer = setInterval(() => {{
-                const scrollHeight = document.documentElement.scrollHeight;
-                window.scrollBy(0, distance);
-                totalHeight += distance;
-                if (totalHeight >= scrollHeight) {{
-                    clearInterval(timer);
-                    window.scrollTo(0, 0);  // Scroll về đầu trang
-                    resolve();
-                }}
-            }}, delay);
-        }});
-    }}
-    """)
+async def _auto_scroll(page: Page, max_scroll_px: int = 6000) -> None:
+    """
+    Scroll từng bước từ đầu trang xuống vùng đáy bài viết (`max_scroll_px`) để kích hoạt lazy-load ảnh.
+    Điều khiển trực tiếp từ Python với giới hạn bước và kiểm tra độ cao để KHÔNG bao giờ
+    cuộn vào vùng infinite-scroll dưới chân trang báo (như giadinh.suckhoedoisong.vn).
+    """
+    max_steps = max(5, min(int(max_scroll_px // SCROLL_STEP_PX) + 2, 25))
+    last_scroll_y = -1
+    try:
+        for _ in range(max_steps):
+            await asyncio.wait_for(
+                page.evaluate(f"window.scrollBy(0, {SCROLL_STEP_PX})"),
+                timeout=2.5,
+            )
+            await page.wait_for_timeout(SCROLL_DELAY_MS)
+            state = await asyncio.wait_for(
+                page.evaluate(
+                    "() => ({ y: window.scrollY || window.pageYOffset || 0, h: document.documentElement.scrollHeight || 0 })"
+                ),
+                timeout=2.5,
+            )
+            cur_y = int(state.get("y", 0))
+            cur_h = int(state.get("h", 0))
+            if cur_y >= max_scroll_px or cur_y + VIEWPORT_HEIGHT >= cur_h or cur_y == last_scroll_y:
+                break
+            last_scroll_y = cur_y
+    except Exception as e:
+        logger.warning(f"_auto_scroll dừng sớm: {e}")
+    finally:
+        try:
+            await asyncio.wait_for(page.evaluate("window.scrollTo(0, 0)"), timeout=2.5)
+        except Exception:
+            pass
 
 
 async def _cleanup_page(page: Page) -> None:
