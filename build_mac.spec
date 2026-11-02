@@ -12,6 +12,7 @@ block_cipher = None
 # Hidden imports cho macOS
 hiddenimports = [
     'docx',
+    'openpyxl',
     'PIL',
     'PIL.Image',
     'numpy',
@@ -39,7 +40,7 @@ possible_caches = [
 
 for cache_dir in possible_caches:
     if cache_dir.exists():
-        for chromium_dir in cache_dir.glob("chromium-*"):
+        for chromium_dir in cache_dir.glob("chromium*"):
             if chromium_dir.is_dir():
                 datas.append((str(chromium_dir), f"chromium/{chromium_dir.name}"))
 

@@ -63,7 +63,61 @@ def generate_output_filename(data: dict) -> str:
     return filename
 
 
+def get_unique_output_path(
+    output_dir: str,
+    filename: str,
+    used_paths: set[str] | None = None,
+    force_index: int | None = None,
+) -> str:
+    """
+    Đảm bảo đường dẫn file đầu ra là duy nhất, không bao giờ ghi đè lên file
+    đã tồn tại trên ổ đĩa hoặc file vừa tạo trong cùng đợt chạy.
+    """
+    stem, ext = os.path.splitext(filename)
+    if not ext:
+        ext = ".docx"
+
+    def _is_taken(path_str: str) -> bool:
+        norm = os.path.normcase(os.path.abspath(path_str))
+        if used_paths is not None and norm in used_paths:
+            return True
+        return os.path.exists(path_str)
+
+    if force_index is not None:
+        counter = max(1, force_index)
+        while True:
+            candidate = os.path.join(output_dir, f"{stem}_{counter:02d}{ext}")
+            if not _is_taken(candidate):
+                if used_paths is not None:
+                    used_paths.add(os.path.normcase(os.path.abspath(candidate)))
+                return candidate
+            counter += 1
+
+    candidate = os.path.join(output_dir, f"{stem}{ext}")
+    if not _is_taken(candidate):
+        if used_paths is not None:
+            used_paths.add(os.path.normcase(os.path.abspath(candidate)))
+        return candidate
+
+    counter = 2
+    while True:
+        candidate = os.path.join(output_dir, f"{stem}_{counter:02d}{ext}")
+        if not _is_taken(candidate):
+            if used_paths is not None:
+                used_paths.add(os.path.normcase(os.path.abspath(candidate)))
+            return candidate
+        counter += 1
+
+
 def open_folder_in_explorer(path: str) -> None:
-    """Mở thư mục trong Windows Explorer."""
+    """Mở thư mục hoặc file trong Windows Explorer / Finder (macOS)."""
+    import subprocess
+    import sys
+
     folder = path if os.path.isdir(path) else os.path.dirname(path)
-    os.startfile(folder)
+    if sys.platform == "darwin":
+        subprocess.run(["open", folder], check=False)
+    elif hasattr(os, "startfile"):
+        os.startfile(folder)
+    else:
+        subprocess.run(["xdg-open", folder], check=False)

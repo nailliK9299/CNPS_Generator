@@ -26,6 +26,7 @@ def build_mac():
         "--add-data=src/core/Readability.js:src/core",
         "--add-data=src/core/Readability.js:core",
         "--hidden-import=docx",
+        "--hidden-import=openpyxl",
         "--hidden-import=PIL",
         "--hidden-import=PIL.Image",
         "--hidden-import=numpy",
@@ -41,7 +42,7 @@ def build_mac():
     print("--> Dang chay PyInstaller...")
     subprocess.run(cmd, check=True)
     
-    # 2. Copy Playwright Chromium browser
+    # 2. Copy Playwright Chromium browser (bao gồm cả chromium-* và chromium_headless_shell-*)
     dist_dir = Path("dist/CNPS_Generator")
     target_chromium_dir = dist_dir / "chromium"
     target_chromium_dir.mkdir(parents=True, exist_ok=True)
@@ -54,7 +55,7 @@ def build_mac():
     found_chromium = False
     for cache_dir in possible_caches:
         if cache_dir.exists():
-            for cdir in cache_dir.glob("chromium-*"):
+            for cdir in cache_dir.glob("chromium*"):
                 if cdir.is_dir():
                     dest = target_chromium_dir / cdir.name
                     print(f"--> Copying Playwright Chromium from {cdir} to {dest}")

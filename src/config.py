@@ -69,9 +69,14 @@ def setup_playwright_browsers() -> str | None:
         exe_dir = os.path.dirname(sys.executable)
         candidates.append(os.path.join(exe_dir, "chromium"))
         candidates.append(os.path.join(exe_dir, "_internal", "chromium"))
+        # Hỗ trợ cấu trúc .app trên macOS (Contents/MacOS -> Contents/Resources hoặc Contents/Frameworks)
+        candidates.append(os.path.abspath(os.path.join(exe_dir, "..", "Resources", "chromium")))
+        candidates.append(os.path.abspath(os.path.join(exe_dir, "..", "Frameworks", "chromium")))
         
     user_appdata_playwright = os.path.expanduser(r"~\AppData\Local\ms-playwright")
     candidates.append(user_appdata_playwright)
+    candidates.append(os.path.expanduser("~/Library/Caches/ms-playwright"))
+    candidates.append(os.path.expanduser("~/.cache/ms-playwright"))
     
     for path in candidates:
         if path and os.path.isdir(path):

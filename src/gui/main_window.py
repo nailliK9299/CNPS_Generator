@@ -21,7 +21,11 @@ from config import (
     APP_TITLE, APP_VERSION, DEFAULT_OUTPUT_DIR, TEMPLATE_PATH,
     FB_STORAGE_STATE_PATH,
 )
-from utils.helpers import generate_output_filename, open_folder_in_explorer
+from utils.helpers import (
+    generate_output_filename,
+    get_unique_output_path,
+    open_folder_in_explorer,
+)
 from utils.table_parser import parse_csv_or_excel_file, parse_clipboard_text
 from core.docx_generator import generate_cnps
 from core.screenshot import capture_screenshots, SessionExpiredError
@@ -494,7 +498,11 @@ class CNPSApp(tk.Tk):
         
         target = SAMPLE_XLSX_PATH if os.path.exists(SAMPLE_XLSX_PATH) else SAMPLE_CSV_PATH
         if os.path.exists(target):
-            os.startfile(target)
+            if sys.platform == "darwin":
+                import subprocess
+                subprocess.run(["open", target], check=False)
+            elif hasattr(os, "startfile"):
+                os.startfile(target)
             self._log(f"📄 Đã mở file Bảng kê mẫu: {os.path.basename(target)}")
         else:
             messagebox.showwarning("Không tìm thấy file mẫu", f"Chưa tìm thấy file Bảng kê mẫu tại:\n{target}")
@@ -528,12 +536,19 @@ class CNPSApp(tk.Tk):
         """Mở Chromium headed, chờ đăng nhập, lưu storage_state."""
         from playwright.async_api import async_playwright
         
+        os.makedirs(os.path.dirname(FB_STORAGE_STATE_PATH), exist_ok=True)
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=False)
-            context = await browser.new_context()
+            context = await browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                ),
+            )
             page = await context.new_page()
             
-            await page.goto("https://www.facebook.com/")
+            await page.goto("https://www.facebook.com/", wait_until="domcontentloaded", timeout=60_000)
             
             self.after(0, lambda: self._log(
                 "ℹ️ Vui lòng đăng nhập Facebook trong cửa sổ trình duyệt vừa mở.\n"
@@ -545,16 +560,27 @@ class CNPSApp(tk.Tk):
                 "Sau khi đăng nhập xong (thấy trang News Feed), đóng trình duyệt lại."
             ))
             
-            # Chờ cho đến khi trình duyệt đóng
+            # Theo dõi và tự động lưu session ngay khi phát hiện cookie c_user, đồng thời chờ đóng cửa sổ
+            for _ in range(300):  # tối đa 5 phút
+                if page.is_closed():
+                    break
+                try:
+                    cookies = await context.cookies("https://www.facebook.com")
+                    if any(c.get("name") == "c_user" for c in cookies):
+                        await context.storage_state(path=FB_STORAGE_STATE_PATH)
+                except Exception:
+                    pass
+                await page.wait_for_timeout(1000)
+            
+            # Lưu session lần cuối trước khi đóng hẳn
             try:
-                await page.wait_for_event("close", timeout=300_000)  # 5 phút
+                await context.storage_state(path=FB_STORAGE_STATE_PATH)
             except Exception:
                 pass
-            
-            # Lưu session
-            os.makedirs(os.path.dirname(FB_STORAGE_STATE_PATH), exist_ok=True)
-            await context.storage_state(path=FB_STORAGE_STATE_PATH)
-            await browser.close()
+            try:
+                await browser.close()
+            except Exception:
+                pass
         
         self.after(0, lambda: self._log("✅ Đã lưu session Facebook thành công."))
         self.after(0, lambda: messagebox.showinfo(
@@ -632,16 +658,40 @@ class CNPSApp(tk.Tk):
         )
         thread.start()
     
+    @staticmethod
+    def _merge_item_data(common_data: dict, item: dict) -> dict:
+        """
+        Gộp thông tin chung và thông tin khoản mục, ưu tiên thông tin chung
+        đã nhập trên giao diện và không để chuỗi rỗng từ item ghi đè.
+        """
+        merged = {**common_data}
+        for k, v in item.items():
+            if k in ("hop_dong", "nhan_hang", "chien_dich", "ten_khach_hang", "ten_viet_tat"):
+                if not merged.get(k) and v:
+                    merged[k] = v
+            else:
+                merged[k] = v
+        return merged
+
     def _do_generate(self, common_data: dict):
         """
         Thực hiện tạo CNPS cho từng khoản mục (chạy trên thread riêng).
-        Mỗi khoản mục = 1 file CNPS.
+        Mỗi khoản mục = 1 file CNPS riêng biệt (không bao giờ ghi đè nhau).
         """
+        from collections import Counter
+
         output_dir = self._output_dir.get()
         os.makedirs(output_dir, exist_ok=True)
         
         results = {"success": [], "failed": []}
         total = len(self._items)
+
+        # Chuẩn bị dữ liệu & tính trước số lượng khoản mục trùng tên file cơ sở
+        merged_items = [self._merge_item_data(common_data, it) for it in self._items]
+        base_filenames = [generate_output_filename(d) for d in merged_items]
+        filename_counts = Counter(base_filenames)
+        filename_seq: dict[str, int] = {}
+        used_output_paths: set[str] = set()
         
         for i, item in enumerate(self._items):
             idx = i + 1
@@ -653,12 +703,27 @@ class CNPSApp(tk.Tk):
             # Thư mục tạm cho ảnh screenshot của khoản mục này
             temp_dir = None
             try:
-                # Merge dữ liệu chung + riêng
-                data = {**common_data, **item}
+                # Dữ liệu chung + riêng đã chuẩn hoá
+                data = merged_items[i]
+                base_filename = base_filenames[i]
                 
-                # Tạo tên file
-                filename = generate_output_filename(data)
-                output_path = os.path.join(output_dir, filename)
+                # Tạo đường dẫn file duy nhất (đánh số _01, _02... nếu trùng tên hoặc đã tồn tại)
+                if filename_counts[base_filename] > 1:
+                    seq = filename_seq.get(base_filename, 0) + 1
+                    filename_seq[base_filename] = seq
+                    output_path = get_unique_output_path(
+                        output_dir,
+                        base_filename,
+                        used_paths=used_output_paths,
+                        force_index=seq,
+                    )
+                else:
+                    output_path = get_unique_output_path(
+                        output_dir,
+                        base_filename,
+                        used_paths=used_output_paths,
+                        force_index=None,
+                    )
                 
                 # Thư mục tạm cho ảnh screenshot
                 temp_dir = tempfile.mkdtemp(prefix="cnps_screenshots_")

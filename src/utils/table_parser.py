@@ -2,6 +2,7 @@
 """
 Module trích xuất và mapping dữ liệu Bảng kê Booking Quảng cáo (từ Google Sheet/Excel/CSV/Clipboard).
 """
+import io
 import re
 import csv
 from datetime import datetime
@@ -169,6 +170,11 @@ def parse_rows_data(rows: list[dict]) -> list[dict]:
             "ngay_dang": format_date_string(item_mapped.get("ngay_dang", "")),
         }
         items.append(item)
+
+    # Nếu bảng kê có chứa các dòng có URL thực sự, lọc bỏ các dòng phí sản xuất/tổng kết không có URL
+    items_with_url = [it for it in items if _is_url(it.get("link_bai", ""))]
+    if items_with_url:
+        return items_with_url
     return items
 
 
@@ -208,9 +214,8 @@ def parse_csv_or_excel_file(filepath: str | Path) -> tuple[list[dict], dict]:
             raise ValueError("Không đọc được mã hóa file CSV/TSV.")
             
         delimiter = "\t" if "\t" in content and content.count("\t") > content.count(",") else ","
-        lines = content.splitlines()
-        reader = csv.reader(lines, delimiter=delimiter)
-        all_rows = list(reader)
+        reader = csv.reader(io.StringIO(content), delimiter=delimiter)
+        all_rows = [r for r in reader if any(str(c).strip() for c in r)]
 
     if not all_rows:
         return [], {}
@@ -219,7 +224,7 @@ def parse_csv_or_excel_file(filepath: str | Path) -> tuple[list[dict], dict]:
 
     header_idx = -1
     best_matches = 0
-    for idx, row in enumerate(all_rows[:10]):
+    for idx, row in enumerate(all_rows[:25]):
         matches = 0
         for cell in row:
             if map_column_name(cell) is not None:
@@ -519,8 +524,8 @@ def parse_clipboard_text(text: str) -> tuple[list[dict], dict]:
         elif ";" in sample_line:
             delimiter = ";"
 
-    reader = csv.reader(lines, delimiter=delimiter)
-    all_rows = list(reader)
+    reader = csv.reader(io.StringIO(text.strip()), delimiter=delimiter)
+    all_rows = [r for r in reader if any(str(c).strip() for c in r)]
     if not all_rows:
         return [], {}
 
@@ -529,7 +534,7 @@ def parse_clipboard_text(text: str) -> tuple[list[dict], dict]:
     # 1. Tìm dòng header tốt nhất dựa trên các từ khóa alias
     header_idx = -1
     best_matches = 0
-    for idx, row in enumerate(all_rows[:10]):
+    for idx, row in enumerate(all_rows[:25]):
         matches = 0
         for cell in row:
             if map_column_name(cell) is not None:

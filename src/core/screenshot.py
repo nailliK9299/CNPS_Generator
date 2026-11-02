@@ -537,6 +537,42 @@ async def _get_block_positions(page: Page, content_bounds: dict) -> list[dict]:
 # Chụp bài Facebook
 # ══════════════════════════════════════════════
 
+def _normalize_facebook_url(url: str) -> str:
+    """Chuẩn hoá URL Facebook (loại bỏ dấu '/' thừa ở cuối path như /share/p/xxx//)."""
+    import re
+    u = (url or "").strip()
+    m = re.match(r"^(https?://[^/]+)(/.*)$", u, flags=re.IGNORECASE)
+    if m:
+        prefix, rest = m.group(1), m.group(2)
+        if "?" in rest:
+            path_part, query_part = rest.split("?", 1)
+            path_part = re.sub(r"/+", "/", path_part)
+            return f"{prefix}{path_part}?{query_part}"
+        else:
+            path_part = re.sub(r"/+", "/", rest)
+            return f"{prefix}{path_part}"
+    return u
+
+
+def _resolve_fb_storage_state_path() -> str | None:
+    """Tìm đường dẫn file fb_storage_state.json ở các vị trí hợp lệ."""
+    candidates = [FB_STORAGE_STATE_PATH]
+    try:
+        from config import BASE_PATH
+        candidates.append(os.path.join(BASE_PATH, "data", "fb_storage_state.json"))
+        candidates.append(os.path.join(BASE_PATH, "dist", "CNPS_Generator", "data", "fb_storage_state.json"))
+    except Exception:
+        pass
+    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    candidates.append(os.path.join(repo_root, "data", "fb_storage_state.json"))
+    candidates.append(os.path.join(repo_root, "dist", "CNPS_Generator", "data", "fb_storage_state.json"))
+
+    for p in candidates:
+        if p and os.path.isfile(p):
+            return p
+    return None
+
+
 async def _capture_facebook(
     url: str,
     output_dir: Path,
@@ -544,80 +580,142 @@ async def _capture_facebook(
 ) -> list[Path]:
     """
     Flow chụp bài Facebook:
-    1. Mở trang với storage_state (session đã đăng nhập)
+    1. Mở trang với storage_state (session đã đăng nhập), dùng domcontentloaded
+       (tránh networkidle vì Facebook duy trì kết nối realtime liên tục)
     2. Kiểm tra redirect → session hết hạn
-    3. Chờ load số liệu tương tác
-    4. Tìm khung bài đăng
+    3. Chờ load nội dung & tự động bấm "Xem thêm" / "See more"
+    4. Tìm khung bài đăng ([role="dialog"] của bài viết hoặc [role="article"] chính)
     5. Chụp element
     6. Phân trang nếu cần
     """
-    if not os.path.exists(FB_STORAGE_STATE_PATH):
+    storage_state_path = _resolve_fb_storage_state_path()
+    if not storage_state_path:
         raise SessionExpiredError(
             "Chưa có session Facebook.\n"
             "Vui lòng bấm nút 'Đăng nhập Facebook' trên giao diện để đăng nhập lần đầu."
         )
-    
+
+    clean_url = _normalize_facebook_url(url)
+
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         try:
             context = await browser.new_context(
-                storage_state=FB_STORAGE_STATE_PATH,
-                viewport={"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
+                storage_state=storage_state_path,
+                viewport={"width": VIEWPORT_WIDTH, "height": 1400},
                 device_scale_factor=DEVICE_SCALE_FACTOR,
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                ),
             )
             page = await context.new_page()
-            
-            # Mở URL
+
+            # Mở URL (dùng domcontentloaded vì Facebook không bao giờ đạt networkidle)
             cb("Đang mở bài Facebook...")
-            await page.goto(url, wait_until="networkidle", timeout=30_000)
-            
-            # Kiểm tra redirect → trang login
-            if "login" in page.url.lower() or "checkpoint" in page.url.lower():
+            try:
+                await page.goto(clean_url, wait_until="domcontentloaded", timeout=30_000)
+            except Exception as e:
+                logger.warning(f"Facebook domcontentloaded timeout, thử commit: {e}")
+                await page.goto(clean_url, wait_until="commit", timeout=20_000)
+
+            # Chờ giao diện Comet của Facebook tải xong bài đăng
+            cb("Đang chờ tải nội dung bài đăng...")
+            await page.wait_for_timeout(3500)
+
+            # Kiểm tra redirect → trang login/checkpoint
+            current_url_lower = page.url.lower()
+            if "/login" in current_url_lower or "checkpoint" in current_url_lower:
                 raise SessionExpiredError(
                     "Session Facebook đã hết hạn.\n"
                     "Vui lòng bấm nút 'Đăng nhập Facebook' để đăng nhập lại."
                 )
-            
-            # Chờ load
-            cb("Đang chờ tải nội dung bài đăng...")
-            await page.wait_for_timeout(3000)
-            
-            # Ẩn popup / overlay
-            await page.add_style_tag(content="""
-                [role="dialog"], [class*="overlay"], [class*="uiLayer"],
-                [data-pagelet="rhc_footer"], [data-pagelet="rightRail"] {
-                    display: none !important;
+
+            # Kiểm tra bài viết bị lỗi / không tồn tại
+            body_text = await page.evaluate("() => (document.body && document.body.innerText) || ''")
+            unavailable_phrases = [
+                "this page isn't available",
+                "this content isn't available",
+                "trang này hiện không hiển thị",
+                "bạn hiện không xem được nội dung này",
+                "nội dung này hiện không hiển thị",
+            ]
+            if any(phrase in body_text.lower() for phrase in unavailable_phrases):
+                raise ContentDetectionError(
+                    f"Bài đăng Facebook không khả dụng hoặc liên kết bị hỏng:\n{clean_url}"
+                )
+
+            # Tự động mở rộng nội dung bài viết ("Xem thêm" / "See more")
+            await page.evaluate("""
+            () => {
+                const buttons = Array.from(
+                    document.querySelectorAll('div[role="button"], span[role="button"]')
+                );
+                for (const btn of buttons) {
+                    const txt = (btn.innerText || '').trim();
+                    if (txt === 'See more' || txt === 'Xem thêm') {
+                        const commentAncestor = btn.closest('[aria-label^="Comment"], [aria-label^="Bình luận"], [aria-label^="Phản hồi"]');
+                        if (!commentAncestor) {
+                            try { btn.click(); } catch (_) {}
+                        }
+                    }
                 }
+            }
             """)
-            
-            # Tìm khung bài đăng
+            await page.wait_for_timeout(800)
+
+            # Tìm khung bài đăng Facebook:
+            # 1. Ưu tiên modal dialog bài đăng (chiều rộng ~500-950px ở giữa trang)
             cb("Đang xác định khung bài đăng...")
-            post_element = await page.query_selector('[role="article"]')
+            post_element = None
+            dialogs = await page.query_selector_all('[role="dialog"]')
+            for dlg in dialogs:
+                box = await dlg.bounding_box()
+                if box and 400 <= box["width"] <= 980 and box["height"] >= 200:
+                    post_element = dlg
+
+            # 2. Nếu bài đăng không nằm trong modal dialog, tìm FeedUnit hoặc article chính (không phải comment/skeleton)
             if not post_element:
                 post_element = await page.query_selector('[data-pagelet*="FeedUnit"]')
+
             if not post_element:
-                # Fallback: chụp phần chính
+                articles = await page.query_selector_all('[role="article"]')
+                for art in articles:
+                    aria = (await art.get_attribute("aria-label") or "").lower()
+                    if aria.startswith(("comment", "bình luận", "phản hồi")):
+                        continue
+                    box = await art.bounding_box()
+                    if not box or box["height"] < 120 or box["width"] < 300:
+                        continue
+                    txt = (await art.inner_text() or "").strip()
+                    has_img = await art.query_selector("img") is not None
+                    if txt or has_img:
+                        post_element = art
+                        break
+
+            # 3. Fallback: chụp phần chính [role="main"]
+            if not post_element:
                 post_element = await page.query_selector('[role="main"]')
-            
+
             if not post_element:
                 raise ContentDetectionError(
                     "Không tìm được khung bài đăng Facebook.\n"
                     "Có thể bài đã bị xoá hoặc tài khoản không có quyền xem."
                 )
-            
+
             # Chụp element
             cb("Đang chụp ảnh bài đăng...")
             screenshot_bytes = await post_element.screenshot(type="png")
-            
+
             # Phân trang nếu ảnh dài
             cb("Đang phân trang ảnh...")
             from PIL import Image
             import io
             img = Image.open(io.BytesIO(screenshot_bytes))
             img_height_css = img.height // DEVICE_SCALE_FACTOR
-            
+
             if img_height_css > TARGET_PAGE_HEIGHT_PX:
-                # Cần phân trang — cắt đều (không có block positions cho FB)
                 page_images = smart_paginate(
                     screenshot_bytes=screenshot_bytes,
                     block_positions=[],
@@ -626,13 +724,12 @@ async def _capture_facebook(
                     device_scale_factor=DEVICE_SCALE_FACTOR,
                 )
             else:
-                # Ảnh ngắn, giữ nguyên
                 single_path = output_dir / "page_001.png"
                 img.save(str(single_path), "PNG")
                 page_images = [single_path]
-            
+
             cb(f"✅ Đã chụp {len(page_images)} trang")
             return page_images
-            
+
         finally:
             await browser.close()

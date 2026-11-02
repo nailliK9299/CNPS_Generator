@@ -39,8 +39,9 @@ output_test/
 *.manifest
 *.spec.bak
 
-# Playwright local binaries
+# Playwright local binaries & session state
 chromium/
+data/fb_storage_state.json
 
 # IDE & OS
 .vscode/
