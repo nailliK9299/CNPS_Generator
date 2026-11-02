@@ -28,7 +28,11 @@ from utils.helpers import (
 )
 from utils.table_parser import parse_csv_or_excel_file, parse_clipboard_text
 from core.docx_generator import generate_cnps
-from core.screenshot import capture_screenshots, SessionExpiredError
+from core.screenshot import (
+    capture_screenshots,
+    SessionExpiredError,
+    ScreenshotCancelledError,
+)
 
 
 class CNPSApp(tk.Tk):
@@ -45,8 +49,10 @@ class CNPSApp(tk.Tk):
         self._items: list[dict] = []
         # Thư mục lưu output
         self._output_dir = tk.StringVar(value=DEFAULT_OUTPUT_DIR)
-        # Trạng thái đang xử lý
+        # Trạng thái đang xử lý / tạm dừng / hủy
         self._processing = False
+        self._paused = False
+        self._cancel_requested = False
         
         self._build_ui()
     
@@ -68,6 +74,10 @@ class CNPSApp(tk.Tk):
         FRAME_BG = "#ffffff"
         PRIMARY_BLUE = "#2563eb"
         PRIMARY_HOVER = "#1d4ed8"
+        WARN_AMBER = "#d97706"
+        WARN_HOVER = "#b45309"
+        DANGER_RED = "#dc2626"
+        DANGER_HOVER = "#b91c1c"
         TEXT_DARK = "#334155"
         
         self.configure(bg=BG_COLOR)
@@ -80,6 +90,10 @@ class CNPSApp(tk.Tk):
         style.configure("TButton", font=(FONT_FAMILY, 10), padding=(10, 6))
         style.configure("Action.TButton", font=(FONT_FAMILY, 11, "bold"), padding=(14, 8), background=PRIMARY_BLUE, foreground="#ffffff")
         style.map("Action.TButton", background=[("active", PRIMARY_HOVER)])
+        style.configure("Pause.TButton", font=(FONT_FAMILY, 10, "bold"), padding=(12, 8), background=WARN_AMBER, foreground="#ffffff")
+        style.map("Pause.TButton", background=[("active", WARN_HOVER), ("disabled", "#e2e8f0")], foreground=[("disabled", "#94a3b8")])
+        style.configure("Cancel.TButton", font=(FONT_FAMILY, 10, "bold"), padding=(12, 8), background=DANGER_RED, foreground="#ffffff")
+        style.map("Cancel.TButton", background=[("active", DANGER_HOVER), ("disabled", "#e2e8f0")], foreground=[("disabled", "#94a3b8")])
         style.configure("Treeview", font=(FONT_FAMILY, 9), rowheight=28, fieldbackground="#ffffff")
         style.configure("Treeview.Heading", font=(FONT_FAMILY, 9, "bold"), background="#f1f5f9", foreground="#0f172a")
         
@@ -276,6 +290,18 @@ class CNPSApp(tk.Tk):
             style="Action.TButton", command=self._start_generate
         )
         self._btn_generate.pack(side="left", padx=5)
+        
+        self._btn_pause = ttk.Button(
+            frame_actions, text="⏸ Tạm dừng",
+            style="Pause.TButton", command=self._toggle_pause, state="disabled"
+        )
+        self._btn_pause.pack(side="left", padx=5)
+        
+        self._btn_cancel = ttk.Button(
+            frame_actions, text="⏹ Hủy lệnh",
+            style="Cancel.TButton", command=self._cancel_generate, state="disabled"
+        )
+        self._btn_cancel.pack(side="left", padx=5)
         
         self._btn_fb_login = ttk.Button(
             frame_actions, text="🔑 Đăng nhập Facebook",
@@ -647,7 +673,11 @@ class CNPSApp(tk.Tk):
         
         # Disable UI, bắt đầu xử lý
         self._processing = True
+        self._paused = False
+        self._cancel_requested = False
         self._btn_generate.configure(state="disabled")
+        self._btn_pause.configure(text="⏸ Tạm dừng", state="normal")
+        self._btn_cancel.configure(text="⏹ Hủy lệnh", state="normal")
         self._progress["value"] = 0
         self._progress["maximum"] = len(self._items)
         
@@ -657,6 +687,48 @@ class CNPSApp(tk.Tk):
             daemon=True
         )
         thread.start()
+
+    def _toggle_pause(self):
+        """Tạm dừng hoặc tiếp tục quá trình tạo Chứng Nhận Phát Sóng."""
+        if not self._processing or self._cancel_requested:
+            return
+        if not self._paused:
+            self._paused = True
+            self._btn_pause.configure(text="▶ Tiếp tục")
+            self._update_status("⏸ Đang tạm dừng — bấm 'Tiếp tục' để chạy tiếp hoặc 'Hủy lệnh' để dừng hẳn.")
+            self._log("⏸ Đã tạm dừng tiến trình tạo Chứng Nhận Phát Sóng.")
+        else:
+            self._paused = False
+            self._btn_pause.configure(text="⏸ Tạm dừng")
+            self._update_status("▶ Đang tiếp tục xử lý...")
+            self._log("▶ Tiếp tục quá trình tạo Chứng Nhận Phát Sóng...")
+
+    def _cancel_generate(self):
+        """Hủy lệnh tạo Chứng Nhận Phát Sóng ngay lập tức."""
+        if not self._processing or self._cancel_requested:
+            return
+        self._cancel_requested = True
+        self._paused = False
+        self._btn_pause.configure(text="⏸ Tạm dừng", state="disabled")
+        self._btn_cancel.configure(text="⏳ Đang hủy...", state="disabled")
+        self._update_status("⏹ Đang hủy lệnh tạo Chứng Nhận Phát Sóng...")
+        self._log("🛑 Đang dừng và hủy lệnh tạo Chứng Nhận Phát Sóng theo yêu cầu...")
+
+    def _get_control_status(self) -> str:
+        """Trả về trạng thái điều khiển hiện tại ('run' | 'pause' | 'cancel') cho luồng chụp ảnh."""
+        if self._cancel_requested:
+            return "cancel"
+        if self._paused:
+            return "pause"
+        return "run"
+
+    def _wait_if_paused_or_cancelled(self):
+        """Chờ nếu đang tạm dừng hoặc ném ScreenshotCancelledError nếu người dùng đã bấm Hủy."""
+        import time
+        while self._paused and not self._cancel_requested:
+            time.sleep(0.15)
+        if self._cancel_requested:
+            raise ScreenshotCancelledError("Đã hủy tạo Chứng Nhận Phát Sóng theo yêu cầu người dùng.")
     
     @staticmethod
     def _merge_item_data(common_data: dict, item: dict) -> dict:
@@ -677,13 +749,14 @@ class CNPSApp(tk.Tk):
         """
         Thực hiện tạo CNPS cho từng khoản mục (chạy trên thread riêng).
         Mỗi khoản mục = 1 file CNPS riêng biệt (không bao giờ ghi đè nhau).
+        Hỗ trợ Tạm dừng / Tiếp tục và Hủy lệnh tức thì.
         """
         from collections import Counter
 
         output_dir = self._output_dir.get()
         os.makedirs(output_dir, exist_ok=True)
         
-        results = {"success": [], "failed": []}
+        results = {"success": [], "failed": [], "cancelled": False, "total": len(self._items)}
         total = len(self._items)
 
         # Chuẩn bị dữ liệu & tính trước số lượng khoản mục trùng tên file cơ sở
@@ -697,12 +770,13 @@ class CNPSApp(tk.Tk):
             idx = i + 1
             noi_dung_short = item["noi_dung_khoan_muc"][:40]
             
-            self.after(0, lambda idx=idx, total=total, s=noi_dung_short:
-                self._update_status(f"Đang xử lý khoản mục {idx}/{total}: {s}..."))
-            
             # Thư mục tạm cho ảnh screenshot của khoản mục này
             temp_dir = None
             try:
+                self._wait_if_paused_or_cancelled()
+                self.after(0, lambda idx=idx, total=total, s=noi_dung_short:
+                    self._update_status(f"Đang xử lý khoản mục {idx}/{total}: {s}..."))
+
                 # Dữ liệu chung + riêng đã chuẩn hoá
                 data = merged_items[i]
                 base_filename = base_filenames[i]
@@ -740,8 +814,11 @@ class CNPSApp(tk.Tk):
                     article_type=data["loai"],
                     output_dir=temp_dir,
                     progress_callback=_progress_cb,
+                    control_callback=self._get_control_status,
                 )
                 
+                self._wait_if_paused_or_cancelled()
+
                 # Tạo file DOCX
                 self.after(0, lambda idx=idx:
                     self._log(f"📝 [{idx}/{total}] Đang tạo file DOCX..."))
@@ -757,6 +834,11 @@ class CNPSApp(tk.Tk):
                 self.after(0, lambda idx=idx, p=str(result_path):
                     self._log(f"✅ [{idx}/{total}] Đã tạo: {os.path.basename(p)}"))
                 
+            except ScreenshotCancelledError:
+                results["cancelled"] = True
+                self.after(0, lambda idx=idx:
+                    self._log(f"🛑 [{idx}/{total}] Đã hủy lệnh tạo Chứng Nhận Phát Sóng."))
+                break
             except SessionExpiredError as e:
                 results["failed"].append((idx, noi_dung_short, str(e)))
                 self.after(0, lambda idx=idx, err=str(e):
@@ -764,6 +846,11 @@ class CNPSApp(tk.Tk):
                 self.after(0, lambda err=str(e): messagebox.showwarning(
                     "Session Facebook", err))
             except Exception as e:
+                if self._cancel_requested:
+                    results["cancelled"] = True
+                    self.after(0, lambda idx=idx:
+                        self._log(f"🛑 [{idx}/{total}] Đã hủy lệnh tạo Chứng Nhận Phát Sóng."))
+                    break
                 results["failed"].append((idx, noi_dung_short, str(e)))
                 self.after(0, lambda idx=idx, err=str(e):
                     self._log(f"❌ [{idx}/{total}] Lỗi: {err}"))
@@ -782,14 +869,30 @@ class CNPSApp(tk.Tk):
         self.after(0, lambda: self._on_generate_complete(results))
     
     def _on_generate_complete(self, results: dict):
-        """Xử lý sau khi tạo CNPS hoàn tất."""
+        """Xử lý sau khi tạo CNPS hoàn tất hoặc bị hủy."""
         self._processing = False
+        self._paused = False
+        self._cancel_requested = False
         self._btn_generate.configure(state="normal")
+        self._btn_pause.configure(text="⏸ Tạm dừng", state="disabled")
+        self._btn_cancel.configure(text="⏹ Hủy lệnh", state="disabled")
         self._btn_open_folder.configure(state="normal")
         
         n_ok = len(results["success"])
         n_fail = len(results["failed"])
+        total = results.get("total", n_ok + n_fail)
         
+        if results.get("cancelled"):
+            self._update_status(f"⏹ Đã hủy lệnh: {n_ok}/{total} khoản mục đã tạo thành công trước khi dừng.")
+            msg = (
+                f"🛑 Đã dừng lệnh tạo Chứng Nhận Phát Sóng.\n\n"
+                f"• Đã hoàn thành trước khi dừng: {n_ok}/{total} khoản mục\n"
+            )
+            if results["failed"]:
+                msg += f"• Thất bại: {n_fail} khoản mục\n"
+            messagebox.showinfo("Đã dừng tiến trình", msg)
+            return
+
         self._update_status(f"Hoàn tất: {n_ok} thành công, {n_fail} thất bại.")
         
         # Tạo thông báo chi tiết

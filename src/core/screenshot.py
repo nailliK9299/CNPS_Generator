@@ -84,6 +84,62 @@ class ContentDetectionError(Exception):
     pass
 
 
+class ScreenshotCancelledError(Exception):
+    """Người dùng chủ động dừng/hủy quá trình chụp và tạo CNPS."""
+    pass
+
+
+async def _wait_control(control_callback=None) -> None:
+    """
+    Kiểm tra trạng thái Tạm dừng ('pause') hoặc Hủy ('cancel') từ GUI.
+    - Nếu 'cancel' -> raise ScreenshotCancelledError ngay lập tức.
+    - Nếu 'pause'  -> tạm dừng tại chỗ (sleep 0.15s) cho đến khi người dùng bấm 'Tiếp tục' hoặc 'Hủy'.
+    """
+    if not control_callback:
+        return
+    while True:
+        status = control_callback()
+        if status == "cancel":
+            raise ScreenshotCancelledError("Đã hủy tạo Chứng Nhận Phát Sóng theo yêu cầu người dùng.")
+        if status == "pause":
+            await asyncio.sleep(0.15)
+            continue
+        break
+
+
+async def _run_cancellable(coro, control_callback=None, timeout: float | None = None):
+    """
+    Chạy một coroutine (như page.goto, page.screenshot) với khả năng hủy tức thì
+    ngay khi người dùng bấm nút 'Dừng / Hủy'.
+    """
+    await _wait_control(control_callback)
+    if not control_callback:
+        if timeout:
+            return await asyncio.wait_for(coro, timeout=timeout)
+        return await coro
+
+    main_task = asyncio.ensure_future(coro)
+
+    async def _watch_cancel():
+        while not main_task.done():
+            if control_callback() == "cancel":
+                main_task.cancel()
+                return
+            await asyncio.sleep(0.15)
+
+    watcher_task = asyncio.ensure_future(_watch_cancel())
+    try:
+        if timeout:
+            return await asyncio.wait_for(main_task, timeout=timeout)
+        return await main_task
+    except asyncio.CancelledError:
+        if control_callback() == "cancel":
+            raise ScreenshotCancelledError("Đã hủy tạo Chứng Nhận Phát Sóng theo yêu cầu người dùng.")
+        raise
+    finally:
+        watcher_task.cancel()
+
+
 # ══════════════════════════════════════════════
 # API chính — gọi từ GUI
 # ══════════════════════════════════════════════
@@ -93,6 +149,7 @@ def capture_screenshots(
     article_type: str,
     output_dir: str | Path,
     progress_callback=None,
+    control_callback=None,
 ) -> list[Path]:
     """
     Chụp screenshot bài báo/Facebook, phân trang, trả về danh sách file ảnh.
@@ -102,6 +159,7 @@ def capture_screenshots(
         article_type: "Báo chí" hoặc "Facebook"
         output_dir: Thư mục lưu ảnh tạm
         progress_callback: Hàm callback(message: str) để báo tiến trình
+        control_callback: Hàm callback() trả về 'run' | 'pause' | 'cancel'
     
     Returns:
         Danh sách Path đến các file ảnh đã phân trang
@@ -109,6 +167,7 @@ def capture_screenshots(
     Raises:
         SessionExpiredError: Session Facebook hết hạn
         ContentDetectionError: Không xác định được nội dung
+        ScreenshotCancelledError: Người dùng bấm hủy
         Exception: Lỗi khác (timeout, 404, ...)
     """
     def _cb(msg):
@@ -117,7 +176,7 @@ def capture_screenshots(
         logger.info(msg)
     
     # Chạy async trong sync context
-    return asyncio.run(_capture_async(url, article_type, output_dir, _cb))
+    return asyncio.run(_capture_async(url, article_type, output_dir, _cb, control_callback))
 
 
 async def _capture_async(
@@ -125,15 +184,17 @@ async def _capture_async(
     article_type: str,
     output_dir: str | Path,
     cb,
+    control_callback=None,
 ) -> list[Path]:
     """Dispatcher async cho 2 loại bài."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    await _wait_control(control_callback)
     
     if article_type == "Facebook":
-        return await _capture_facebook(url, output_dir, cb)
+        return await _capture_facebook(url, output_dir, cb, control_callback)
     else:
-        return await _capture_article(url, output_dir, cb)
+        return await _capture_article(url, output_dir, cb, control_callback)
 
 
 # ══════════════════════════════════════════════
@@ -144,6 +205,7 @@ async def _capture_article(
     url: str,
     output_dir: Path,
     cb,
+    control_callback=None,
 ) -> list[Path]:
     """
     Flow chụp bài báo:
@@ -155,6 +217,7 @@ async def _capture_article(
     6. Lấy toạ độ khối nội dung con
     7. Phân trang thông minh (Pillow)
     """
+    await _wait_control(control_callback)
     async with async_playwright() as p:
         browser = await launch_browser(p, headless=True)
         try:
@@ -170,17 +233,36 @@ async def _capture_article(
             page = await context.new_page()
             
             # 1. Navigate
+            await _wait_control(control_callback)
             cb("Đang mở trang...")
             try:
-                await page.goto(url, wait_until="domcontentloaded", timeout=25_000)
+                await _run_cancellable(
+                    page.goto(url, wait_until="domcontentloaded", timeout=25_000),
+                    control_callback=control_callback,
+                    timeout=26.0,
+                )
+            except ScreenshotCancelledError:
+                raise
             except Exception as e:
                 logger.warning(f"domcontentloaded timeout, thử commit: {e}")
-                await page.goto(url, wait_until="commit", timeout=15_000)
+                await _run_cancellable(
+                    page.goto(url, wait_until="commit", timeout=15_000),
+                    control_callback=control_callback,
+                    timeout=16.0,
+                )
                 await page.wait_for_timeout(2000)
+
+            await _wait_control(control_callback)
 
             # Chờ ngắn networkidle (tối đa 3.5s) để ảnh/font tải thêm nhưng không bị treo bởi quảng cáo
             try:
-                await page.wait_for_load_state("networkidle", timeout=3_500)
+                await _run_cancellable(
+                    page.wait_for_load_state("networkidle", timeout=3_500),
+                    control_callback=control_callback,
+                    timeout=4.0,
+                )
+            except ScreenshotCancelledError:
+                raise
             except Exception:
                 pass
             
@@ -193,6 +275,7 @@ async def _capture_article(
                 raise Exception(f"Trang không tồn tại (404): {url}")
             
             # 2. Ước lượng sơ bộ đáy bài viết trước khi scroll để tránh cuộn vào vùng infinite-scroll cuối trang
+            await _wait_control(control_callback)
             try:
                 initial_bounds = await asyncio.wait_for(_detect_content_bounds(page), timeout=5.0)
             except Exception:
@@ -202,9 +285,10 @@ async def _capture_article(
 
             # Auto-scroll từng bước từ Python (có giới hạn chiều cao bài viết để không kích hoạt infinite-scroll)
             cb("Đang scroll để tải nội dung...")
-            await _auto_scroll(page, max_scroll_px=max_scroll_px)
+            await _auto_scroll(page, max_scroll_px=max_scroll_px, control_callback=control_callback)
             
             # 3. Dọn giao diện
+            await _wait_control(control_callback)
             cb("Đang dọn quảng cáo, popup...")
             try:
                 await asyncio.wait_for(_cleanup_page(page), timeout=8.0)
@@ -217,6 +301,7 @@ async def _capture_article(
             await page.wait_for_timeout(POST_CLEANUP_WAIT_MS)
             
             # 4. Xác định vùng nội dung chính xác sau khi lazy-load ảnh
+            await _wait_control(control_callback)
             cb("Đang xác định vùng nội dung bài viết...")
             try:
                 content_bounds = await asyncio.wait_for(_detect_content_bounds(page), timeout=10.0)
@@ -246,6 +331,7 @@ async def _capture_article(
                 content_bounds["bottom"] = min(int(content_bounds["bottom"]), 15000)
             
             # 5. Lấy toạ độ khối nội dung con trước khi giới hạn chiều cao trang chụp
+            await _wait_control(control_callback)
             cb("Đang phân tích cấu trúc trang...")
             try:
                 block_positions = await asyncio.wait_for(
@@ -257,6 +343,7 @@ async def _capture_article(
                 block_positions = []
 
             # 6. Chụp ảnh full page (giới hạn chiều cao DOM nếu trang có phần đuôi quá dài) rồi crop bằng Pillow
+            await _wait_control(control_callback)
             cb("Đang chụp ảnh...")
             try:
                 await asyncio.wait_for(page.evaluate("window.scrollTo(0, 0)"), timeout=3.0)
@@ -285,8 +372,9 @@ async def _capture_article(
             except Exception:
                 pass
 
-            full_screenshot_bytes = await asyncio.wait_for(
+            full_screenshot_bytes = await _run_cancellable(
                 page.screenshot(full_page=True, type="png"),
+                control_callback=control_callback,
                 timeout=30.0,
             )
             
@@ -309,6 +397,7 @@ async def _capture_article(
             del _full_img, _cropped, _buf
             
             # 7. Phân trang thông minh
+            await _wait_control(control_callback)
             cb("Đang phân trang ảnh...")
             page_images = smart_paginate(
                 screenshot_bytes=screenshot_bytes,
@@ -322,10 +411,13 @@ async def _capture_article(
             return page_images
             
         finally:
-            await browser.close()
+            try:
+                await browser.close()
+            except Exception:
+                pass
 
 
-async def _auto_scroll(page: Page, max_scroll_px: int = 6000) -> None:
+async def _auto_scroll(page: Page, max_scroll_px: int = 6000, control_callback=None) -> None:
     """
     Scroll từng bước từ đầu trang xuống vùng đáy bài viết (`max_scroll_px`) để kích hoạt lazy-load ảnh.
     Điều khiển trực tiếp từ Python với giới hạn bước và kiểm tra độ cao để KHÔNG bao giờ
@@ -335,6 +427,7 @@ async def _auto_scroll(page: Page, max_scroll_px: int = 6000) -> None:
     last_scroll_y = -1
     try:
         for _ in range(max_steps):
+            await _wait_control(control_callback)
             await asyncio.wait_for(
                 page.evaluate(f"window.scrollBy(0, {SCROLL_STEP_PX})"),
                 timeout=2.5,
@@ -351,6 +444,8 @@ async def _auto_scroll(page: Page, max_scroll_px: int = 6000) -> None:
             if cur_y >= max_scroll_px or cur_y + VIEWPORT_HEIGHT >= cur_h or cur_y == last_scroll_y:
                 break
             last_scroll_y = cur_y
+    except ScreenshotCancelledError:
+        raise
     except Exception as e:
         logger.warning(f"_auto_scroll dừng sớm: {e}")
     finally:
@@ -657,6 +752,7 @@ async def _capture_facebook(
     url: str,
     output_dir: Path,
     cb,
+    control_callback=None,
 ) -> list[Path]:
     """
     Flow chụp bài Facebook:
@@ -668,6 +764,7 @@ async def _capture_facebook(
     5. Chụp element
     6. Phân trang nếu cần
     """
+    await _wait_control(control_callback)
     storage_state_path = _resolve_fb_storage_state_path()
     if not storage_state_path:
         raise SessionExpiredError(
@@ -693,16 +790,32 @@ async def _capture_facebook(
             page = await context.new_page()
 
             # Mở URL (dùng domcontentloaded vì Facebook không bao giờ đạt networkidle)
+            await _wait_control(control_callback)
             cb("Đang mở bài Facebook...")
             try:
-                await page.goto(clean_url, wait_until="domcontentloaded", timeout=30_000)
+                await _run_cancellable(
+                    page.goto(clean_url, wait_until="domcontentloaded", timeout=30_000),
+                    control_callback=control_callback,
+                    timeout=31.0,
+                )
+            except ScreenshotCancelledError:
+                raise
             except Exception as e:
                 logger.warning(f"Facebook domcontentloaded timeout, thử commit: {e}")
-                await page.goto(clean_url, wait_until="commit", timeout=20_000)
+                await _run_cancellable(
+                    page.goto(clean_url, wait_until="commit", timeout=20_000),
+                    control_callback=control_callback,
+                    timeout=21.0,
+                )
 
             # Chờ giao diện Comet của Facebook tải xong bài đăng
+            await _wait_control(control_callback)
             cb("Đang chờ tải nội dung bài đăng...")
-            await page.wait_for_timeout(3500)
+            await _run_cancellable(
+                page.wait_for_timeout(3500),
+                control_callback=control_callback,
+                timeout=5.0,
+            )
 
             # Kiểm tra redirect → trang login/checkpoint
             current_url_lower = page.url.lower()
@@ -727,6 +840,7 @@ async def _capture_facebook(
                 )
 
             # Tự động mở rộng nội dung bài viết ("Xem thêm" / "See more")
+            await _wait_control(control_callback)
             await page.evaluate("""
             () => {
                 const buttons = Array.from(
@@ -747,6 +861,7 @@ async def _capture_facebook(
 
             # Tìm khung bài đăng Facebook:
             # 1. Ưu tiên modal dialog bài đăng (chiều rộng ~500-950px ở giữa trang)
+            await _wait_control(control_callback)
             cb("Đang xác định khung bài đăng...")
             post_element = None
             dialogs = await page.query_selector_all('[role="dialog"]')
@@ -785,10 +900,16 @@ async def _capture_facebook(
                 )
 
             # Chụp element
+            await _wait_control(control_callback)
             cb("Đang chụp ảnh bài đăng...")
-            screenshot_bytes = await post_element.screenshot(type="png")
+            screenshot_bytes = await _run_cancellable(
+                post_element.screenshot(type="png"),
+                control_callback=control_callback,
+                timeout=25.0,
+            )
 
             # Phân trang nếu ảnh dài
+            await _wait_control(control_callback)
             cb("Đang phân trang ảnh...")
             from PIL import Image
             import io
@@ -812,4 +933,7 @@ async def _capture_facebook(
             return page_images
 
         finally:
-            await browser.close()
+            try:
+                await browser.close()
+            except Exception:
+                pass
