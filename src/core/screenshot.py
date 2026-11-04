@@ -274,26 +274,34 @@ async def _capture_article(
             if page.url.endswith("/404") or "not found" in page_title:
                 raise Exception(f"Trang không tồn tại (404): {url}")
             
-            # 2. Ước lượng sơ bộ đáy bài viết trước khi scroll để tránh cuộn vào vùng infinite-scroll cuối trang
+            # 2. Kích hoạt sớm ảnh lazy-load & ước lượng đáy bài viết trước khi scroll
             await _wait_control(control_callback)
+            try:
+                await asyncio.wait_for(_force_lazy_images(page), timeout=4.0)
+            except Exception:
+                pass
             try:
                 initial_bounds = await asyncio.wait_for(_detect_content_bounds(page), timeout=5.0)
             except Exception:
                 initial_bounds = None
-            max_scroll_px = (int(initial_bounds["bottom"]) + 600) if initial_bounds else 6000
-            max_scroll_px = max(2500, min(max_scroll_px, 10000))
+            max_scroll_px = (int(initial_bounds["bottom"]) + 800) if initial_bounds else 6500
+            max_scroll_px = max(3000, min(max_scroll_px, 11000))
 
             # Auto-scroll từng bước từ Python (có giới hạn chiều cao bài viết để không kích hoạt infinite-scroll)
             cb("Đang scroll để tải nội dung...")
             await _auto_scroll(page, max_scroll_px=max_scroll_px, control_callback=control_callback)
             
-            # 3. Dọn giao diện
+            # 3. Dọn giao diện & đảm bảo toàn bộ ảnh trong bài đã tải xong
             await _wait_control(control_callback)
             cb("Đang dọn quảng cáo, popup...")
             try:
                 await asyncio.wait_for(_cleanup_page(page), timeout=8.0)
             except Exception as e:
                 logger.warning(f"_cleanup_page timeout/error: {e}")
+            try:
+                await asyncio.wait_for(_force_lazy_images(page), timeout=5.0)
+            except Exception as e:
+                logger.warning(f"_force_lazy_images timeout/error: {e}")
             try:
                 await asyncio.wait_for(_fix_relative_dates(page, url), timeout=5.0)
             except Exception as e:
@@ -309,20 +317,24 @@ async def _capture_article(
                 logger.warning(f"_detect_content_bounds timeout/error: {e}")
                 content_bounds = initial_bounds
             
-            if content_bounds is None:
+            # Nếu sau khi cleanup mà bottom quá nhỏ (< 700px) trong khi initial_bounds lớn hơn, ưu tiên dùng giá trị lớn hơn
+            if content_bounds and initial_bounds and content_bounds.get("bottom", 0) < 700 and initial_bounds.get("bottom", 0) >= 700:
+                content_bounds["bottom"] = initial_bounds["bottom"]
+
+            if content_bounds is None or int(content_bounds.get("bottom", 0)) < 400:
                 logger.warning(f"Không xác định được nội dung — chụp full page: {url}")
                 cb("⚠️ Không tìm được vùng nội dung — chụp toàn trang")
                 # Fallback: chụp full page (giới hạn chiều cao tối đa 12000px để tránh treo bộ nhớ)
                 try:
                     full_height = await asyncio.wait_for(
-                        page.evaluate("document.documentElement.scrollHeight"),
+                        page.evaluate("Math.max(document.documentElement.scrollHeight || 0, document.body ? document.body.scrollHeight : 0)"),
                         timeout=5.0,
                     )
                 except Exception:
                     full_height = VIEWPORT_HEIGHT * 4
                 content_bounds = {
                     "top": 0,
-                    "bottom": min(int(full_height), 12000),
+                    "bottom": max(VIEWPORT_HEIGHT, min(int(full_height), 12000)),
                     "left": 0,
                     "width": VIEWPORT_WIDTH,
                 }
@@ -330,7 +342,16 @@ async def _capture_article(
                 # Giới hạn chiều cao tối đa 15000px để tránh lỗi quá tải texture khi trang quá dài
                 content_bounds["bottom"] = min(int(content_bounds["bottom"]), 15000)
             
-            # 5. Lấy toạ độ khối nội dung con trước khi giới hạn chiều cao trang chụp
+            # Chờ toàn bộ ảnh <img> nằm trong vùng bài viết tải hoàn tất
+            try:
+                await asyncio.wait_for(
+                    _wait_for_article_images(page, int(content_bounds["bottom"])),
+                    timeout=4.5,
+                )
+            except Exception:
+                pass
+
+            # 5. Lấy toạ độ khối nội dung con
             await _wait_control(control_callback)
             cb("Đang phân tích cấu trúc trang...")
             try:
@@ -342,7 +363,10 @@ async def _capture_article(
                 logger.warning(f"_get_block_positions timeout/error: {e}")
                 block_positions = []
 
-            # 6. Chụp ảnh full page (giới hạn chiều cao DOM nếu trang có phần đuôi quá dài) rồi crop bằng Pillow
+            # 6. Chụp ảnh full page rồi crop bằng Pillow
+            # LƯU Ý QUAN TRỌNG: Tuyệt đối KHÔNG gán overflow:hidden hay maxHeight lên html/body
+            # vì các trang như cafebiz.vn, soha.vn có html,body { height: 100% } (900px) -> nếu gán
+            # overflow:hidden sẽ làm Chromium cắt cụt toàn bộ nội dung bên dưới 900px thành màu trắng/xám!
             await _wait_control(control_callback)
             cb("Đang chụp ảnh...")
             try:
@@ -351,23 +375,42 @@ async def _capture_article(
                 pass
             await page.wait_for_timeout(300)
             
-            capture_height = max(VIEWPORT_HEIGHT, min(int(content_bounds["bottom"]) + 100, 15000))
+            capture_height = max(VIEWPORT_HEIGHT, min(int(content_bounds["bottom"]) + 150, 15000))
             try:
                 await asyncio.wait_for(
                     page.evaluate(f"""
                     () => {{
-                        const sh = document.documentElement.scrollHeight || 0;
-                        if (sh > {capture_height + 800}) {{
-                            document.documentElement.style.maxHeight = '{capture_height}px';
-                            document.documentElement.style.overflow = 'hidden';
-                            if (document.body) {{
-                                document.body.style.maxHeight = '{capture_height}px';
-                                document.body.style.overflow = 'hidden';
+                        // Đảm bảo html và body luôn hiển thị đầy đủ chiều cao, không bị giới hạn 900px
+                        for (const rootEl of [document.documentElement, document.body]) {{
+                            if (!rootEl) continue;
+                            rootEl.style.setProperty('display', 'block', 'important');
+                            rootEl.style.setProperty('visibility', 'visible', 'important');
+                            rootEl.style.setProperty('height', 'auto', 'important');
+                            rootEl.style.setProperty('max-height', 'none', 'important');
+                            rootEl.style.setProperty('overflow', 'visible', 'important');
+                            rootEl.style.setProperty('overflow-y', 'visible', 'important');
+                            rootEl.style.setProperty('overflow-x', 'hidden', 'important');
+                        }}
+                        // Nếu trang có phần đuôi infinite-scroll quá dài (> capture_height + 1500),
+                        // chỉ ẩn các khối con nằm hoàn toàn bên dưới vùng bài viết để giảm chiều cao trang
+                        const sh = Math.max(
+                            document.documentElement.scrollHeight || 0,
+                            document.body ? document.body.scrollHeight : 0
+                        );
+                        if (sh > {capture_height + 1500}) {{
+                            const cutoff = {capture_height + 300};
+                            const blocks = document.querySelectorAll('body > *, main > *, div > section, div > div, footer');
+                            for (const el of blocks) {{
+                                const r = el.getBoundingClientRect();
+                                const absTop = r.top + (window.scrollY || 0);
+                                if (absTop > cutoff && r.height > 50) {{
+                                    el.style.setProperty('display', 'none', 'important');
+                                }}
                             }}
                         }}
                     }}
                     """),
-                    timeout=3.0,
+                    timeout=4.0,
                 )
             except Exception:
                 pass
@@ -385,10 +428,12 @@ async def _capture_article(
             scale = DEVICE_SCALE_FACTOR
             crop_top = 0
             crop_bottom = min(int(content_bounds["bottom"] * scale), _full_img.height)
+            if crop_bottom <= int(300 * scale):
+                crop_bottom = _full_img.height
             
-            # Luôn giữ trọn vẹn toàn bộ chiều rộng trang (x=0 -> full width) để không cắt xén lề trái và đảm bảo tỷ lệ vừa khít khổ A4
+            # Giữ chiều rộng chuẩn theo VIEWPORT_WIDTH * scale (tránh dải trắng thừa bên phải nếu trang bị tràn ngang như bongda.com.vn)
             crop_left = 0
-            crop_right = _full_img.width
+            crop_right = min(int(VIEWPORT_WIDTH * scale), _full_img.width)
                 
             _cropped = _full_img.crop((crop_left, crop_top, crop_right, crop_bottom))
             _buf = _io.BytesIO()
@@ -417,25 +462,97 @@ async def _capture_article(
                 pass
 
 
+async def _force_lazy_images(page: Page) -> None:
+    """
+    Ép toàn bộ ảnh lazy-load (data-src, data-original, data-lazy-src, loading='lazy',...)
+    trong trang tải ngay lập tức và hiển thị đầy đủ (tránh mất ảnh giữa bài như trên kenh14.vn).
+    """
+    await page.evaluate("""
+    () => {
+        const lazyAttrs = ['data-src', 'data-original', 'data-lazy-src', 'data-lazy', 'data-url', 'data-hi-res-src'];
+        const imgs = document.querySelectorAll('img');
+        for (const img of imgs) {
+            img.loading = 'eager';
+            img.removeAttribute('loading');
+            img.decoding = 'sync';
+            for (const attr of lazyAttrs) {
+                const val = img.getAttribute(attr);
+                if (val && (val.startsWith('http') || val.startsWith('//'))) {
+                    const curSrc = img.getAttribute('src') || '';
+                    if (!curSrc || curSrc.startsWith('data:') || curSrc.includes('blank') || curSrc.includes('spacer') || curSrc.includes('1x1')) {
+                        img.setAttribute('src', val);
+                    }
+                    break;
+                }
+            }
+            const dataSrcset = img.getAttribute('data-srcset');
+            if (dataSrcset && !img.getAttribute('srcset')) {
+                img.setAttribute('srcset', dataSrcset);
+            }
+            const cs = getComputedStyle(img);
+            if (cs.opacity === '0') {
+                img.style.setProperty('opacity', '1', 'important');
+            }
+            if (cs.visibility === 'hidden') {
+                img.style.setProperty('visibility', 'visible', 'important');
+            }
+        }
+        const sources = document.querySelectorAll('picture source');
+        for (const srcEl of sources) {
+            const ds = srcEl.getAttribute('data-srcset') || srcEl.getAttribute('data-src');
+            if (ds && !srcEl.getAttribute('srcset')) {
+                srcEl.setAttribute('srcset', ds);
+            }
+        }
+    }
+    """)
+
+
+async def _wait_for_article_images(page: Page, max_bottom_px: int) -> None:
+    """Chờ các thẻ <img> nằm trong vùng bài viết (0..max_bottom_px) tải xong dữ liệu ảnh."""
+    await page.evaluate(f"""
+    async () => {{
+        const imgs = Array.from(document.querySelectorAll('img')).filter(img => {{
+            const r = img.getBoundingClientRect();
+            const top = r.top + (window.scrollY || 0);
+            return r.width > 40 && r.height > 40 && top >= 0 && top <= {max_bottom_px};
+        }});
+        await Promise.all(imgs.map(img => {{
+            if (img.complete && img.naturalWidth > 0) return Promise.resolve();
+            return new Promise(res => {{
+                const t = setTimeout(res, 2500);
+                img.addEventListener('load', () => {{ clearTimeout(t); res(); }}, {{ once: true }});
+                img.addEventListener('error', () => {{ clearTimeout(t); res(); }}, {{ once: true }});
+            }});
+        }}));
+    }}
+    """)
+
+
 async def _auto_scroll(page: Page, max_scroll_px: int = 6000, control_callback=None) -> None:
     """
     Scroll từng bước từ đầu trang xuống vùng đáy bài viết (`max_scroll_px`) để kích hoạt lazy-load ảnh.
     Điều khiển trực tiếp từ Python với giới hạn bước và kiểm tra độ cao để KHÔNG bao giờ
     cuộn vào vùng infinite-scroll dưới chân trang báo (như giadinh.suckhoedoisong.vn).
     """
-    max_steps = max(5, min(int(max_scroll_px // SCROLL_STEP_PX) + 2, 25))
+    max_steps = max(6, min(int(max_scroll_px // SCROLL_STEP_PX) + 3, 28))
     last_scroll_y = -1
     try:
-        for _ in range(max_steps):
+        for step_idx in range(max_steps):
             await _wait_control(control_callback)
             await asyncio.wait_for(
                 page.evaluate(f"window.scrollBy(0, {SCROLL_STEP_PX})"),
                 timeout=2.5,
             )
+            if step_idx % 4 == 0:
+                try:
+                    await asyncio.wait_for(_force_lazy_images(page), timeout=2.0)
+                except Exception:
+                    pass
             await page.wait_for_timeout(SCROLL_DELAY_MS)
             state = await asyncio.wait_for(
                 page.evaluate(
-                    "() => ({ y: window.scrollY || window.pageYOffset || 0, h: document.documentElement.scrollHeight || 0 })"
+                    "() => ({ y: window.scrollY || window.pageYOffset || 0, h: Math.max(document.documentElement.scrollHeight || 0, document.body ? document.body.scrollHeight : 0) })"
                 ),
                 timeout=2.5,
             )
@@ -456,11 +573,15 @@ async def _auto_scroll(page: Page, max_scroll_px: int = 6000, control_callback=N
 
 
 async def _cleanup_page(page: Page) -> None:
-    """Ẩn quảng cáo/popup và ép fixed/sticky → static."""
+    """
+    Ẩn quảng cáo/popup, ép fixed/sticky → static, và bảo vệ tuyệt đối
+    thẻ html, body cùng các khối tổ tiên chứa bài viết (tránh lỗi mất trang trên
+    thanhnien.vn, vtcnews.vn, 2sao.vn và lỗi cắt cụt 900px trên cafebiz.vn, soha.vn).
+    """
     # Inject CSS ẩn quảng cáo
     await page.add_style_tag(content=HIDE_ADS_CSS)
     
-    # Ép fixed/sticky → static
+    # Ép fixed/sticky → static & bảo vệ cấu trúc trang bài viết
     await page.evaluate("""
     () => {
         const all = document.querySelectorAll('*');
@@ -468,6 +589,82 @@ async def _cleanup_page(page: Page) -> None:
             const style = getComputedStyle(el);
             if (style.position === 'fixed' || style.position === 'sticky') {
                 el.style.setProperty('position', 'static', 'important');
+            }
+        }
+
+        // Bảo vệ html, body luôn hiển thị đầy đủ chiều cao thực tế
+        for (const rootEl of [document.documentElement, document.body]) {
+            if (!rootEl) continue;
+            rootEl.style.setProperty('display', 'block', 'important');
+            rootEl.style.setProperty('visibility', 'visible', 'important');
+            rootEl.style.setProperty('height', 'auto', 'important');
+            rootEl.style.setProperty('max-height', 'none', 'important');
+            rootEl.style.setProperty('overflow', 'visible', 'important');
+            rootEl.style.setProperty('overflow-y', 'visible', 'important');
+            rootEl.style.setProperty('overflow-x', 'hidden', 'important');
+        }
+
+        // Tìm các khối chứa nội dung bài viết và đảm bảo không tổ tiên nào của chúng bị ẩn bởi CSS quảng cáo
+        const articleNodes = document.querySelectorAll(
+            'article, main, [itemprop="articleBody"], #article_body, #maincontent, ' +
+            '.detail-content, .afcbc-body, .fck_detail, .the-article-body, ' +
+            '.content-detail, .edittor-content, .nd-detail, .cate-24h-foot-arti-deta-info, ' +
+            '.cate-24h-foot-arti-deta-content-main, .singular-content, .cms-body'
+        );
+        const protectedSet = new Set();
+        for (const node of articleNodes) {
+            if (node.querySelectorAll('p').length >= 2) {
+                let cur = node;
+                while (cur && cur !== document.documentElement) {
+                    protectedSet.add(cur);
+                    cur = cur.parentElement;
+                }
+            }
+        }
+        for (const el of protectedSet) {
+            const cs = getComputedStyle(el);
+            if (cs.display === 'none') {
+                el.style.setProperty('display', 'block', 'important');
+            }
+            if (cs.visibility === 'hidden') {
+                el.style.setProperty('visibility', 'visible', 'important');
+            }
+            if (cs.maxHeight === '0px' || cs.height === '0px') {
+                el.style.setProperty('height', 'auto', 'important');
+                el.style.setProperty('max-height', 'none', 'important');
+            }
+            if (cs.overflow === 'hidden' || cs.overflowY === 'hidden') {
+                el.style.setProperty('overflow', 'visible', 'important');
+                el.style.setProperty('overflow-y', 'visible', 'important');
+            }
+        }
+
+        // 4. Thu gọn các khung chứa quảng cáo rỗng (placeholder) nằm phía trên tiêu đề bài viết (h1)
+        // tránh để lại khoảng trắng lớn giữa thanh menu và tiêu đề bài báo (vd: thanhnien.vn, 2sao.vn)
+        const h1 = document.querySelector('h1');
+        if (h1) {
+            const h1Top = h1.getBoundingClientRect().top + window.scrollY;
+            const topBlocks = document.querySelectorAll('div, section, aside, ins');
+            for (const blk of topBlocks) {
+                if (protectedSet.has(blk) || blk.contains(h1)) continue;
+                if (blk.closest('header, nav, .header, #header')) continue;
+                const r = blk.getBoundingClientRect();
+                const absBottom = r.bottom + window.scrollY;
+                if (r.height >= 100 && absBottom <= h1Top + 20) {
+                    const txt = (blk.innerText || '').trim();
+                    const visibleMedia = Array.from(blk.querySelectorAll('img, svg, video, canvas, input')).some(m => {
+                        const mr = m.getBoundingClientRect();
+                        const mcs = getComputedStyle(m);
+                        return mr.width > 10 && mr.height > 10 && mcs.display !== 'none' && mcs.visibility !== 'hidden';
+                    });
+                    if (txt.length === 0 && !visibleMedia) {
+                        blk.style.setProperty('display', 'none', 'important');
+                        blk.style.setProperty('height', '0', 'important');
+                        blk.style.setProperty('min-height', '0', 'important');
+                        blk.style.setProperty('margin', '0', 'important');
+                        blk.style.setProperty('padding', '0', 'important');
+                    }
+                }
             }
         }
     }
@@ -534,7 +731,7 @@ async def _fix_relative_dates(page: Page, url: str) -> None:
 
 async def _detect_content_bounds(page: Page) -> dict | None:
     """
-    Xác định vùng nội dung bài viết bằng Readability.js.
+    Xác định vùng nội dung bài viết bằng Readability.js kết hợp bộ lọc phần tử bài báo Việt Nam.
     
     Returns:
         {"top": 0, "bottom": int, "left": 0, "width": int} hoặc None nếu thất bại.
@@ -553,49 +750,107 @@ async def _detect_content_bounds(page: Page) -> dict | None:
             const clone = document.cloneNode(true);
             const article = new Readability(clone).parse();
             
-            if (!article || !article.textContent || article.textContent.length < 100) {
-                return null;
+            const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+            const articleFullText = article && article.textContent ? norm(article.textContent) : '';
+            
+            // 1. Ưu tiên kiểm tra các selector thân bài báo chuẩn của các báo điện tử Việt Nam
+            // (Lưu ý: tuyệt đối loại trừ các class tiện ích flexbox như justify-content-*, align-content-*)
+            const prioritySelectors = [
+                '[itemprop="articleBody"]',
+                '#article_body',
+                '.cate-24h-foot-arti-deta-info',
+                '.cate-24h-foot-arti-deta-content-main',
+                '.detail-content',
+                '.afcbc-body',
+                '.fck_detail',
+                '.the-article-body',
+                '.content-detail',
+                '.edittor-content',
+                '.nd-detail',
+                '#maincontent',
+                '.singular-content',
+                '.cms-body',
+                '.article-content',
+                '.article-body',
+                '.post-content',
+                '.entry-content',
+                '.knc-content',
+                '.detail__cmain',
+                'article',
+                'main',
+                '[class*="content"]:not(footer):not(header):not(nav):not([class*="justify-content"]):not([class*="align-content"])'
+            ];
+
+            const candidateSet = new Set();
+            for (const sel of prioritySelectors) {
+                for (const el of document.querySelectorAll(sel)) {
+                    candidateSet.add(el);
+                }
             }
-            
-            // Lấy 500 ký tự đầu để so sánh
-            const articleText = article.textContent.substring(0, 500).trim();
-            
-            // Tìm phần tử DOM gốc match tốt nhất
-            const candidates = document.querySelectorAll(
-                'article, main, [itemprop="articleBody"], ' +
-                '[class*="content"]:not(footer):not(header):not(nav), ' +
-                '[class*="article-body"], [class*="post-content"], ' +
-                '[class*="entry-content"], [class*="detail-content"], ' +
-                '[class*="fck_detail"], [class*="the-article-body"]'
-            );
-            
+
             let bestMatch = null;
             let bestScore = 0;
-            
-            for (const el of candidates) {
-                const elText = el.textContent.substring(0, 500).trim();
-                if (elText.length < 50) continue;
-                
-                // Tính overlap đơn giản: số từ chung / tổng từ
-                const articleWords = new Set(articleText.split(/\\s+/));
-                const elWords = elText.split(/\\s+/);
-                let common = 0;
-                for (const w of elWords) {
-                    if (articleWords.has(w)) common++;
+
+            const articleSample = articleFullText.substring(0, 800);
+            const articleWords = new Set(articleSample ? articleSample.split(' ') : []);
+            const minRequiredLen = articleFullText.length > 400 ? Math.min(350, Math.floor(articleFullText.length * 0.3)) : 120;
+
+            for (const el of candidateSet) {
+                const rect = el.getBoundingClientRect();
+                // Bỏ qua các phần tử quá thấp (như thanh breadcrumb 17px, menu, tiêu đề phụ) hoặc ẩn
+                if (rect.height < 250 || rect.width < 250) continue;
+
+                // Dùng innerText để không bị lẫn mã nguồn <script>/<style> nội tuyến (như trên 24h.com.vn)
+                const elFullText = norm(el.innerText || el.textContent || '');
+                const pCount = el.querySelectorAll('p').length;
+                if (elFullText.length < minRequiredLen && pCount < 3) continue;
+
+                let score = 0;
+                if (articleWords.size > 5) {
+                    const elSampleWords = new Set(elFullText.substring(0, 1000).split(' '));
+                    let common = 0;
+                    for (const w of articleWords) {
+                        if (elSampleWords.has(w)) common++;
+                    }
+                    const overlap = common / Math.max(articleWords.size, 1);
+
+                    // Tỷ lệ bao phủ độ dài bài viết (tránh chọn khối con chỉ chứa sapo hoặc chọn cả trang chứa hàng chục tin liên quan)
+                    const lenRatio = Math.min(elFullText.length, Math.max(articleFullText.length, 500)) /
+                                     Math.max(elFullText.length, articleFullText.length, 500);
+                    score = overlap * 0.7 + lenRatio * 0.3;
+                } else {
+                    score = Math.min(pCount / 15.0, 1.0);
                 }
-                const score = common / Math.max(articleWords.size, 1);
-                
+
+                // Thưởng điểm cho các phần tử có class/id chuyên biệt của thân bài báo
+                const idCls = ((el.id || '') + ' ' + String(el.className || '')).toLowerCase();
+                if (
+                    el.getAttribute('itemprop') === 'articleBody' ||
+                    idCls.includes('detail-content') ||
+                    idCls.includes('afcbc-body') ||
+                    idCls.includes('fck_detail') ||
+                    idCls.includes('arti-deta-info') ||
+                    idCls.includes('article_body') ||
+                    idCls.includes('content-detail') ||
+                    idCls.includes('edittor-content') ||
+                    idCls.includes('nd-detail')
+                ) {
+                    score += 0.25;
+                }
+
                 if (score > bestScore) {
                     bestScore = score;
                     bestMatch = el;
                 }
             }
             
-            // Fallback: tìm div chứa nhiều <p> nhất
-            if (!bestMatch || bestScore < 0.3) {
+            // Fallback: tìm khối chứa nhiều <p> hợp lệ nhất (có chiều cao >= 300px)
+            if (!bestMatch || bestScore < 0.25) {
                 let maxP = 0;
-                const divs = document.querySelectorAll('div, section, article');
+                const divs = document.querySelectorAll('article, section, div, main');
                 for (const div of divs) {
+                    const r = div.getBoundingClientRect();
+                    if (r.height < 300 || r.width < 250) continue;
                     const pCount = div.querySelectorAll(':scope > p').length;
                     if (pCount > maxP) {
                         maxP = pCount;
@@ -605,8 +860,21 @@ async def _detect_content_bounds(page: Page) -> dict | None:
             }
             
             if (bestMatch) {
+                const scrollY = window.scrollY || window.pageYOffset || 0;
                 const rect = bestMatch.getBoundingClientRect();
-                let bottom = Math.ceil(rect.bottom + window.scrollY);
+                let bottom = Math.ceil(rect.bottom + scrollY);
+
+                // Đảm bảo bottom bao trùm toàn bộ các thẻ <p>, <figure>, <img> hiển thị bên trong bestMatch
+                const innerBlocks = bestMatch.querySelectorAll('p, figure, img, blockquote, table, ul, ol');
+                for (const child of innerBlocks) {
+                    const cr = child.getBoundingClientRect();
+                    if (cr.height > 5 && cr.width > 20) {
+                        const cb = Math.ceil(cr.bottom + scrollY);
+                        if (cb > bottom && cb < bottom + 4000) {
+                            bottom = cb;
+                        }
+                    }
+                }
                 
                 // Mở rộng bottom bao gồm các phần tử footer/meta ngay dưới bài (tags, nguồn bài, copy link, tác giả...)
                 const parent = bestMatch.parentElement || document.body;
@@ -618,7 +886,7 @@ async def _detect_content_bounds(page: Page) -> dict | None:
                 );
                 for (const el of footerCandidates) {
                     const elRect = el.getBoundingClientRect();
-                    const elBottom = Math.ceil(elRect.bottom + window.scrollY);
+                    const elBottom = Math.ceil(elRect.bottom + scrollY);
                     if (elBottom > bottom && elBottom < bottom + 500) {
                         bottom = elBottom;
                     }
@@ -627,12 +895,16 @@ async def _detect_content_bounds(page: Page) -> dict | None:
                 // Thêm padding an toàn bên dưới bài viết (80px) để chụp trọn vẹn tag và nút bấm
                 bottom += 80;
 
-                const fullScrollHeight = document.documentElement.scrollHeight;
-                bottom = Math.min(bottom, fullScrollHeight);
+                const fullScrollHeight = Math.max(
+                    document.documentElement.scrollHeight || 0,
+                    document.body ? document.body.scrollHeight : 0
+                );
+                if (fullScrollHeight > 0) {
+                    bottom = Math.min(bottom, fullScrollHeight);
+                }
                 
                 // Tính ranh giới chiều ngang chính xác của khối nội dung
-                const docWidth = document.documentElement.clientWidth;
-                let left = 0;
+                const docWidth = document.documentElement.clientWidth || 1080;
                 let right = Math.min(docWidth, Math.ceil(rect.right) + 20);
 
                 return {

@@ -378,29 +378,30 @@ SCROLL_DELAY_MS = 250          # Delay giữa mỗi bước scroll (ms)
 POST_CLEANUP_WAIT_MS = 1000    # Chờ sau khi dọn giao diện trước khi chụp
 
 # ─── CSS ẩn quảng cáo / popup / widget (áp dụng chung mọi domain) ───
+# Lưu ý quan trọng: KHÔNG dùng [class*="ads"] hay [class*="ad-"] trực tiếp mà không loại trừ
+# html/body/main/article vì nhiều báo (thanhnien.vn, vtcnews.vn, 2sao.vn) gắn class
+# 'backgroundads', 'isads', 'load-news-detail', 'vads-desktop' ngay trên thẻ <html> hoặc <body>!
 HIDE_ADS_CSS = """
-/* Quảng cáo */
-[class*="ads"], [class*="advertisement"], [id*="ads"],
-[class*="adsbygoogle"], [class*="ad-"], [id*="ad-"],
+/* Quảng cáo chuyên biệt (loại trừ html, body, main, article, section) */
+ins.adsbygoogle,
+[class*="adsbygoogle"]:not(html):not(body):not(main):not(article),
+[class*="advertisement"]:not(html):not(body):not(main):not(article),
+[id^="div-gpt-ad"], [id^="google_ads"], [id^="admzone"], [id^="ads_"],
+[class^="ads-"]:not(html):not(body):not(main):not(article),
+.ads-box, .box-ads, .banner-ads, .ad-container, .ad-slot, .ad-banner,
 iframe[src*="doubleclick"], iframe[src*="googlesyndication"],
-iframe[src*="facebook.com/plugins"],
+iframe[src*="facebook.com/plugins"], iframe[id*="google_ads"],
 
-/* Banner */
-[class*="banner"]:not(header):not([class*="header"]),
+/* Popup / Modal / Floating / Cookie (loại trừ html, body, main, article) */
+.popup:not(html):not(body):not(main):not(article),
+.modal:not(html):not(body):not(main):not(article),
+[class*="popup"]:not(html):not(body):not(main):not(article),
+[class*="cookie"]:not(html):not(body):not(main):not(article),
+[class*="gdpr"]:not(html):not(body):not(main):not(article),
+[class*="consent"]:not(html):not(body):not(main):not(article),
 
-/* Popup / Modal / Floating */
-.popup, .modal, [class*="popup"], [class*="modal"],
-[class*="floating"], [class*="overlay"],
-[class*="cookie"], [class*="gdpr"], [class*="consent"],
-
-/* Feedback / Widget */
-[class*="feedback"], [id*="feedback"],
-[class*="social-share"], [class*="share-bar"],
-[class*="widget"]:not([class*="content"]),
-
-/* Bài liên quan / Bình luận / Footer trang web (không ẩn footer bài viết) */
-[class*="related"], [id*="related"],
-[class*="comment"], [id*="comment"], .comment-section,
+/* Bình luận / Footer trang web (không ẩn footer bài viết) */
+.comment-section, #ykcb-form, .box-comment,
 .site-footer, .page-footer, #site-footer, #footer-site
 {
     display: none !important;

@@ -29,8 +29,13 @@ def smart_paginate(
     output_dir.mkdir(parents=True, exist_ok=True)
     
     img = Image.open(io.BytesIO(screenshot_bytes))
-    img_width, img_height = img.size  # pixel vật lý
+    if img.mode != "RGB":
+        img = img.convert("RGB")
     scale = device_scale_factor
+
+    # Cắt bỏ khoảng trống đồng màu (trắng/xám) thừa ở dưới đáy ảnh tổng trước khi chia trang
+    img = _trim_bottom_blank_space(img, min_keep_height=int(400 * scale))
+    img_width, img_height = img.size  # pixel vật lý
     
     max_page_height_px = int(target_page_height * scale)  # ~4860px ở 3x scale
     
@@ -38,6 +43,7 @@ def smart_paginate(
     cut_points_px = _compute_pixel_whitespace_cuts(img, max_page_height_px)
     
     page_images = []
+    fallback_first_crop = None
     for i in range(len(cut_points_px) - 1):
         top = cut_points_px[i]
         bottom = cut_points_px[i + 1]
@@ -46,12 +52,15 @@ def smart_paginate(
             continue
             
         page_img = img.crop((0, top, img_width, bottom))
+        if fallback_first_crop is None:
+            fallback_first_crop = page_img
         
-        # Kiểm tra khoảng trắng
+        # Kiểm tra trang trống (toàn màu trắng hoặc toàn màu nền đồng nhất không có chữ/ảnh)
         white_ratio = _calculate_white_ratio(page_img)
-        if white_ratio >= 0.96 or page_img.height < int(50 * scale):
+        uniform_ratio = _calculate_uniform_row_ratio(page_img)
+        if white_ratio >= 0.96 or uniform_ratio >= 0.975 or page_img.height < int(50 * scale):
             logger.warning(
-                f"Bỏ qua lát cắt ảnh {i + 1}: {white_ratio * 100:.0f}% khoảng trắng / height={page_img.height}px (trang trống)"
+                f"Bỏ qua lát cắt ảnh {i + 1}: white={white_ratio * 100:.0f}%, uniform={uniform_ratio * 100:.0f}%, height={page_img.height}px (trang trống)"
             )
             continue
             
@@ -60,7 +69,40 @@ def smart_paginate(
         page_images.append(page_path)
         logger.info(f"Trang {len(page_images)}: {page_img.width}x{page_img.height}px ({page_img.height / scale:.0f} CSS px), trắng={white_ratio:.1%}")
         
+    # Đảm bảo không bao giờ trả về danh sách rỗng nếu ảnh gốc có dữ liệu
+    if not page_images and fallback_first_crop is not None:
+        page_path = output_dir / "page_001.png"
+        fallback_first_crop.save(str(page_path), "PNG")
+        page_images.append(page_path)
+
     return page_images
+
+
+def _trim_bottom_blank_space(img: Image.Image, min_keep_height: int = 1200) -> Image.Image:
+    """Cắt bỏ phần nền trống đồng nhất (trắng hoặc xám nhạt) bị dư ở cuối ảnh trước khi phân trang."""
+    w, h = img.size
+    if h <= min_keep_height:
+        return img
+    arr = np.array(img)
+    # Dòng đồng nhất: độ lệch chuẩn ngang trên cả 3 kênh màu < 2.0
+    row_std = arr.std(axis=1).max(axis=1)
+    non_blank_indices = np.where(row_std >= 2.0)[0]
+    if len(non_blank_indices) == 0:
+        return img
+    last_content_y = int(non_blank_indices[-1])
+    new_bottom = min(h, max(min_keep_height, last_content_y + 120))
+    if new_bottom < h - 150:
+        return img.crop((0, 0, w, new_bottom))
+    return img
+
+
+def _calculate_uniform_row_ratio(img: Image.Image) -> float:
+    """Tính tỷ lệ các dòng ngang đồng màu (không có chữ hay chi tiết ảnh, vd nền xám #f1f1f1)."""
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+    arr = np.array(img)
+    row_std = arr.std(axis=1).max(axis=1)
+    return float((row_std < 2.0).sum()) / float(len(row_std))
 
 
 def _compute_pixel_whitespace_cuts(
