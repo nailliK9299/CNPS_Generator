@@ -99,6 +99,12 @@ def build_mac():
         # Ký ad-hoc (codesign) để chạy mượt trên chip Apple Silicon (M1/M2/M3/M4)
         subprocess.run(["codesign", "--force", "--deep", "--sign", "-", str(dest_app)], check=False)
     subprocess.run(["codesign", "--force", "--deep", "--sign", "-", str(dist_dir / "CNPS_Generator")], check=False)
+
+    # 4. Copy file Hướng dẫn sử dụng vào thư mục đóng gói macOS
+    guide_file = Path("Huong_Dan_Su_Dung_CNPS_Generator.docx")
+    if guide_file.exists():
+        shutil.copy2(guide_file, dist_dir / guide_file.name)
+        print(f"--> Da copy {guide_file.name} vao {dist_dir}")
         
     print("==========================================")
     print("✅ HOÀN THÀNH ĐÓNG GÓI MACOS THÀNH CÔNG!")
