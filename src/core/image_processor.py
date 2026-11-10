@@ -11,6 +11,9 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
+# Cho phép xử lý ảnh chụp màn hình bài báo dài (eMagazine 3x scale) không bị giới hạn DecompressionBombError
+Image.MAX_IMAGE_PIXELS = None
+
 logger = logging.getLogger(__name__)
 
 
@@ -58,7 +61,7 @@ def smart_paginate(
         # Kiểm tra trang trống (toàn màu trắng hoặc toàn màu nền đồng nhất không có chữ/ảnh)
         white_ratio = _calculate_white_ratio(page_img)
         uniform_ratio = _calculate_uniform_row_ratio(page_img)
-        if white_ratio >= 0.96 or uniform_ratio >= 0.975 or page_img.height < int(50 * scale):
+        if white_ratio >= 0.992 or uniform_ratio >= 0.975 or (white_ratio >= 0.96 and uniform_ratio >= 0.95) or page_img.height < int(50 * scale):
             logger.warning(
                 f"Bỏ qua lát cắt ảnh {i + 1}: white={white_ratio * 100:.0f}%, uniform={uniform_ratio * 100:.0f}%, height={page_img.height}px (trang trống)"
             )

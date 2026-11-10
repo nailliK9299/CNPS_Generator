@@ -9,6 +9,7 @@ import os
 import copy
 from pathlib import Path
 
+from PIL import Image
 from docx import Document
 from docx.shared import Cm, Pt, Emu
 from docx.enum.text import WD_BREAK
@@ -16,6 +17,8 @@ from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 
 from config import IMAGE_WIDTH_CM
+
+Image.MAX_IMAGE_PIXELS = None
 
 
 def generate_cnps(

@@ -880,8 +880,9 @@ class CNPSApp(tk.Tk):
                     self.after(0, lambda idx=idx:
                         self._log(f"🛑 [{idx}/{total}] Đã hủy lệnh tạo Chứng Nhận Phát Sóng."))
                     break
-                results["failed"].append((idx, noi_dung_short, str(e)))
-                self.after(0, lambda idx=idx, err=str(e):
+                err_msg = str(e).strip() or f"Quá thời gian phản hồi khi tải/chụp trang ({type(e).__name__})"
+                results["failed"].append((idx, noi_dung_short, err_msg))
+                self.after(0, lambda idx=idx, err=err_msg:
                     self._log(f"❌ [{idx}/{total}] Lỗi: {err}"))
             finally:
                 # Dọn thư mục tạm

@@ -7,12 +7,17 @@ Hỗ trợ 2 loại:
 - "facebook": bài Facebook (dùng storage_state để đăng nhập)
 """
 import asyncio
+import io
 import logging
 import os
 import tempfile
 from pathlib import Path
 
+from PIL import Image
 from playwright.async_api import async_playwright, Page, BrowserContext
+
+# Tắt giới hạn DecompressionBombError của Pillow cho ảnh chụp màn hình bài báo dài ở 3x scale
+Image.MAX_IMAGE_PIXELS = None
 
 from config import (
     VIEWPORT_WIDTH, VIEWPORT_HEIGHT, DEVICE_SCALE_FACTOR,
@@ -186,15 +191,81 @@ async def _capture_async(
     cb,
     control_callback=None,
 ) -> list[Path]:
-    """Dispatcher async cho 2 loại bài."""
+    """Dispatcher async cho 2 loại bài (kèm cơ chế tự động thử lại 1 lần nếu mạng/trang phản hồi chậm)."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     await _wait_control(control_callback)
     
-    if article_type == "Facebook":
-        return await _capture_facebook(url, output_dir, cb, control_callback)
-    else:
-        return await _capture_article(url, output_dir, cb, control_callback)
+    last_err = None
+    for attempt in range(2):
+        try:
+            if article_type == "Facebook":
+                return await _capture_facebook(url, output_dir, cb, control_callback)
+            else:
+                return await _capture_article(url, output_dir, cb, control_callback)
+        except (ScreenshotCancelledError, SessionExpiredError):
+            raise
+        except Exception as e:
+            last_err = e
+            if attempt == 0:
+                await _wait_control(control_callback)
+                cb("⚠️ Trang phản hồi chậm, đang thử tải và chụp lại...")
+                await asyncio.sleep(1.0)
+            else:
+                if not str(e).strip():
+                    raise RuntimeError(f"Quá thời gian phản hồi khi tải/chụp trang ({type(e).__name__}): {url}") from e
+                raise
+    raise last_err
+
+
+async def _capture_clipped_chunks(
+    page: Page,
+    capture_width: int,
+    capture_height: int,
+    scale: int,
+    control_callback=None,
+) -> bytes:
+    """
+    Chụp vùng bài viết (0..capture_height CSS px) theo từng dải dọc 3000 CSS px (9000 px vật lý ở 3x scale).
+    Giải quyết triệt để:
+    1. Lỗi vượt ngưỡng GPU texture 16,384px của Chromium trên bài eMagazine dài (khiến phần thân dưới bị trắng).
+    2. Lỗi DecompressionBombError hoặc treo bộ nhớ khi trang có đuôi infinite-scroll dài hàng chục nghìn pixel.
+    3. Lỗi TimeoutError do chờ CSS animations vô tận (nhờ animations='disabled').
+    """
+    chunk_css_h = 3000
+    total_phys_w = int(capture_width * scale)
+    total_phys_h = int(capture_height * scale)
+    stitched = Image.new("RGB", (total_phys_w, total_phys_h), (255, 255, 255))
+
+    y_css = 0
+    while y_css < capture_height:
+        await _wait_control(control_callback)
+        h_css = min(chunk_css_h, capture_height - y_css)
+        if h_css <= 0:
+            break
+
+        chunk_bytes = await _run_cancellable(
+            page.screenshot(
+                full_page=True,
+                clip={"x": 0, "y": y_css, "width": capture_width, "height": h_css},
+                animations="disabled",
+                type="png",
+            ),
+            control_callback=control_callback,
+            timeout=25.0,
+        )
+        chunk_img = Image.open(io.BytesIO(chunk_bytes))
+        if chunk_img.mode != "RGB":
+            chunk_img = chunk_img.convert("RGB")
+        stitched.paste(chunk_img, (0, int(y_css * scale)))
+        del chunk_img
+        y_css += h_css
+
+    buf = io.BytesIO()
+    stitched.save(buf, format="PNG")
+    res = buf.getvalue()
+    del stitched, buf
+    return res
 
 
 # ══════════════════════════════════════════════
@@ -209,12 +280,12 @@ async def _capture_article(
 ) -> list[Path]:
     """
     Flow chụp bài báo:
-    1. Mở trang (viewport desktop, scale 2x)
-    2. Auto-scroll kích lazy-load
-    3. Dọn giao diện (ẩn ads, ép fixed→static)
-    4. Xác định vùng nội dung (Readability.js)
-    5. Chụp ảnh dài (clip)
-    6. Lấy toạ độ khối nội dung con
+    1. Mở trang (viewport desktop, scale 3x)
+    2. Phát hiện eMagazine cuộn ngang (#track.track) để chuyển sang bố cục dọc
+    3. Auto-scroll kích lazy-load
+    4. Dọn giao diện (ẩn ads, ép fixed→static, hiện các khối scroll-reveal)
+    5. Xác định vùng nội dung (Readability.js + bộ lọc eMagazine)
+    6. Chụp ảnh theo từng dải clip (tránh giới hạn 16,384px GPU texture)
     7. Phân trang thông minh (Pillow)
     """
     await _wait_control(control_callback)
@@ -224,6 +295,7 @@ async def _capture_article(
             context = await browser.new_context(
                 viewport={"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
                 device_scale_factor=DEVICE_SCALE_FACTOR,
+                reduced_motion="reduce",
                 user_agent=(
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -273,6 +345,34 @@ async def _capture_article(
                 page_title = ""
             if page.url.endswith("/404") or "not found" in page_title:
                 raise Exception(f"Trang không tồn tại (404): {url}")
+
+            # Kiểm tra bài eMagazine thiết kế cuộn ngang (#track.track) và chuyển viewport sang tỉ lệ dọc
+            # (1080x1150 -> aspect-ratio < 1) để CSS của trang tự động xếp chồng toàn bộ các slide theo chiều dọc
+            is_emagazine = False
+            try:
+                emag_info = await asyncio.wait_for(
+                    page.evaluate("""
+                    () => {
+                        const tr = document.querySelector('#track.track, main.track');
+                        let horizTrack = false;
+                        if (tr) {
+                            const cs = getComputedStyle(tr);
+                            horizTrack = (cs.display === 'flex' && cs.flexDirection === 'row') || cs.position === 'fixed';
+                        }
+                        const isMag = horizTrack || Boolean(
+                            document.querySelector('#contentMagazine, .sp-body-content, .sp-detail-content, .emagazine-content, .magazine-content')
+                        );
+                        return { horizTrack, isMag };
+                    }
+                    """),
+                    timeout=3.0,
+                )
+                is_emagazine = bool(emag_info and emag_info.get("isMag"))
+                if emag_info and emag_info.get("horizTrack"):
+                    await page.set_viewport_size({"width": VIEWPORT_WIDTH, "height": 1150})
+                    await page.wait_for_timeout(600)
+            except Exception:
+                pass
             
             # 2. Kích hoạt sớm ảnh lazy-load & ước lượng đáy bài viết trước khi scroll
             await _wait_control(control_callback)
@@ -284,12 +384,19 @@ async def _capture_article(
                 initial_bounds = await asyncio.wait_for(_detect_content_bounds(page), timeout=5.0)
             except Exception:
                 initial_bounds = None
-            max_scroll_px = (int(initial_bounds["bottom"]) + 800) if initial_bounds else 6500
-            max_scroll_px = max(3000, min(max_scroll_px, 11000))
+
+            max_allowed_height = 28000 if is_emagazine else 16500
+            max_scroll_px = (int(initial_bounds["bottom"]) + 1200) if initial_bounds else (14000 if is_emagazine else 7500)
+            max_scroll_px = max(3500, min(max_scroll_px, max_allowed_height))
 
             # Auto-scroll từng bước từ Python (có giới hạn chiều cao bài viết để không kích hoạt infinite-scroll)
             cb("Đang scroll để tải nội dung...")
-            await _auto_scroll(page, max_scroll_px=max_scroll_px, control_callback=control_callback)
+            await _auto_scroll(
+                page,
+                max_scroll_px=max_scroll_px,
+                is_emagazine=is_emagazine,
+                control_callback=control_callback,
+            )
             
             # 3. Dọn giao diện & đảm bảo toàn bộ ảnh trong bài đã tải xong
             await _wait_control(control_callback)
@@ -324,7 +431,7 @@ async def _capture_article(
             if content_bounds is None or int(content_bounds.get("bottom", 0)) < 400:
                 logger.warning(f"Không xác định được nội dung — chụp full page: {url}")
                 cb("⚠️ Không tìm được vùng nội dung — chụp toàn trang")
-                # Fallback: chụp full page (giới hạn chiều cao tối đa 12000px để tránh treo bộ nhớ)
+                # Fallback: chụp full page (giới hạn chiều cao tối đa để tránh treo bộ nhớ)
                 try:
                     full_height = await asyncio.wait_for(
                         page.evaluate("Math.max(document.documentElement.scrollHeight || 0, document.body ? document.body.scrollHeight : 0)"),
@@ -334,19 +441,18 @@ async def _capture_article(
                     full_height = VIEWPORT_HEIGHT * 4
                 content_bounds = {
                     "top": 0,
-                    "bottom": max(VIEWPORT_HEIGHT, min(int(full_height), 12000)),
+                    "bottom": max(VIEWPORT_HEIGHT, min(int(full_height), max_allowed_height)),
                     "left": 0,
                     "width": VIEWPORT_WIDTH,
                 }
             else:
-                # Giới hạn chiều cao tối đa 15000px để tránh lỗi quá tải texture khi trang quá dài
-                content_bounds["bottom"] = min(int(content_bounds["bottom"]), 15000)
+                content_bounds["bottom"] = min(int(content_bounds["bottom"]), max_allowed_height)
             
             # Chờ toàn bộ ảnh <img> nằm trong vùng bài viết tải hoàn tất
             try:
                 await asyncio.wait_for(
                     _wait_for_article_images(page, int(content_bounds["bottom"])),
-                    timeout=4.5,
+                    timeout=5.5,
                 )
             except Exception:
                 pass
@@ -363,7 +469,7 @@ async def _capture_article(
                 logger.warning(f"_get_block_positions timeout/error: {e}")
                 block_positions = []
 
-            # 6. Chụp ảnh full page rồi crop bằng Pillow
+            # 6. Chụp ảnh theo từng dải clip 3000px rồi ghép bằng Pillow
             # LƯU Ý QUAN TRỌNG: Tuyệt đối KHÔNG gán overflow:hidden hay maxHeight lên html/body
             # vì các trang như cafebiz.vn, soha.vn có html,body { height: 100% } (900px) -> nếu gán
             # overflow:hidden sẽ làm Chromium cắt cụt toàn bộ nội dung bên dưới 900px thành màu trắng/xám!
@@ -375,7 +481,7 @@ async def _capture_article(
                 pass
             await page.wait_for_timeout(300)
             
-            capture_height = max(VIEWPORT_HEIGHT, min(int(content_bounds["bottom"]) + 150, 15000))
+            capture_height = max(VIEWPORT_HEIGHT, min(int(content_bounds["bottom"]), max_allowed_height))
             try:
                 await asyncio.wait_for(
                     page.evaluate(f"""
@@ -391,23 +497,6 @@ async def _capture_article(
                             rootEl.style.setProperty('overflow-y', 'visible', 'important');
                             rootEl.style.setProperty('overflow-x', 'hidden', 'important');
                         }}
-                        // Nếu trang có phần đuôi infinite-scroll quá dài (> capture_height + 1500),
-                        // chỉ ẩn các khối con nằm hoàn toàn bên dưới vùng bài viết để giảm chiều cao trang
-                        const sh = Math.max(
-                            document.documentElement.scrollHeight || 0,
-                            document.body ? document.body.scrollHeight : 0
-                        );
-                        if (sh > {capture_height + 1500}) {{
-                            const cutoff = {capture_height + 300};
-                            const blocks = document.querySelectorAll('body > *, main > *, div > section, div > div, footer');
-                            for (const el of blocks) {{
-                                const r = el.getBoundingClientRect();
-                                const absTop = r.top + (window.scrollY || 0);
-                                if (absTop > cutoff && r.height > 50) {{
-                                    el.style.setProperty('display', 'none', 'important');
-                                }}
-                            }}
-                        }}
                     }}
                     """),
                     timeout=4.0,
@@ -415,31 +504,13 @@ async def _capture_article(
             except Exception:
                 pass
 
-            full_screenshot_bytes = await _run_cancellable(
-                page.screenshot(full_page=True, type="png"),
+            screenshot_bytes = await _capture_clipped_chunks(
+                page=page,
+                capture_width=VIEWPORT_WIDTH,
+                capture_height=capture_height,
+                scale=DEVICE_SCALE_FACTOR,
                 control_callback=control_callback,
-                timeout=30.0,
             )
-            
-            # Crop ảnh theo content_bounds (tính bằng CSS px → nhân scale)
-            from PIL import Image as _Image
-            import io as _io
-            _full_img = _Image.open(_io.BytesIO(full_screenshot_bytes))
-            scale = DEVICE_SCALE_FACTOR
-            crop_top = 0
-            crop_bottom = min(int(content_bounds["bottom"] * scale), _full_img.height)
-            if crop_bottom <= int(300 * scale):
-                crop_bottom = _full_img.height
-            
-            # Giữ chiều rộng chuẩn theo VIEWPORT_WIDTH * scale (tránh dải trắng thừa bên phải nếu trang bị tràn ngang như bongda.com.vn)
-            crop_left = 0
-            crop_right = min(int(VIEWPORT_WIDTH * scale), _full_img.width)
-                
-            _cropped = _full_img.crop((crop_left, crop_top, crop_right, crop_bottom))
-            _buf = _io.BytesIO()
-            _cropped.save(_buf, format="PNG")
-            screenshot_bytes = _buf.getvalue()
-            del _full_img, _cropped, _buf
             
             # 7. Phân trang thông minh
             await _wait_control(control_callback)
@@ -529,13 +600,19 @@ async def _wait_for_article_images(page: Page, max_bottom_px: int) -> None:
     """)
 
 
-async def _auto_scroll(page: Page, max_scroll_px: int = 6000, control_callback=None) -> None:
+async def _auto_scroll(
+    page: Page,
+    max_scroll_px: int = 6000,
+    is_emagazine: bool = False,
+    control_callback=None,
+) -> None:
     """
     Scroll từng bước từ đầu trang xuống vùng đáy bài viết (`max_scroll_px`) để kích hoạt lazy-load ảnh.
     Điều khiển trực tiếp từ Python với giới hạn bước và kiểm tra độ cao để KHÔNG bao giờ
     cuộn vào vùng infinite-scroll dưới chân trang báo (như giadinh.suckhoedoisong.vn).
     """
-    max_steps = max(6, min(int(max_scroll_px // SCROLL_STEP_PX) + 3, 28))
+    max_cap = 28000 if is_emagazine else 16500
+    max_steps = max(8, min(int(max_scroll_px // SCROLL_STEP_PX) + 6, 75 if is_emagazine else 42))
     last_scroll_y = -1
     try:
         for step_idx in range(max_steps):
@@ -544,7 +621,7 @@ async def _auto_scroll(page: Page, max_scroll_px: int = 6000, control_callback=N
                 page.evaluate(f"window.scrollBy(0, {SCROLL_STEP_PX})"),
                 timeout=2.5,
             )
-            if step_idx % 4 == 0:
+            if step_idx % 3 == 0:
                 try:
                     await asyncio.wait_for(_force_lazy_images(page), timeout=2.0)
                 except Exception:
@@ -552,12 +629,24 @@ async def _auto_scroll(page: Page, max_scroll_px: int = 6000, control_callback=N
             await page.wait_for_timeout(SCROLL_DELAY_MS)
             state = await asyncio.wait_for(
                 page.evaluate(
-                    "() => ({ y: window.scrollY || window.pageYOffset || 0, h: Math.max(document.documentElement.scrollHeight || 0, document.body ? document.body.scrollHeight : 0) })"
+                    """() => {
+                        const y = window.scrollY || window.pageYOffset || 0;
+                        const h = Math.max(
+                            document.documentElement.scrollHeight || 0,
+                            document.body ? document.body.scrollHeight : 0
+                        );
+                        const emag = document.querySelector('#contentMagazine, .sp-body-content, #track.track, .sp-detail-content');
+                        const emagBottom = emag ? Math.ceil(emag.getBoundingClientRect().bottom + y) : 0;
+                        return { y, h, emagBottom };
+                    }"""
                 ),
                 timeout=2.5,
             )
             cur_y = int(state.get("y", 0))
             cur_h = int(state.get("h", 0))
+            emag_bottom = int(state.get("emagBottom", 0))
+            if emag_bottom > max_scroll_px:
+                max_scroll_px = min(emag_bottom + 600, max_cap)
             if cur_y >= max_scroll_px or cur_y + VIEWPORT_HEIGHT >= cur_h or cur_y == last_scroll_y:
                 break
             last_scroll_y = cur_y
@@ -576,7 +665,7 @@ async def _cleanup_page(page: Page) -> None:
     """
     Ẩn quảng cáo/popup, ép fixed/sticky → static, và bảo vệ tuyệt đối
     thẻ html, body cùng các khối tổ tiên chứa bài viết (tránh lỗi mất trang trên
-    thanhnien.vn, vtcnews.vn, 2sao.vn và lỗi cắt cụt 900px trên cafebiz.vn, soha.vn).
+    thanhnien.vn, vtcnews.vn, 2sao.vn và lỗi cắt cụt 900px trên cafebiz.vn, soha.vn, kenh14 eMagazine).
     """
     # Inject CSS ẩn quảng cáo
     await page.add_style_tag(content=HIDE_ADS_CSS)
@@ -606,14 +695,15 @@ async def _cleanup_page(page: Page) -> None:
 
         // Tìm các khối chứa nội dung bài viết và đảm bảo không tổ tiên nào của chúng bị ẩn bởi CSS quảng cáo
         const articleNodes = document.querySelectorAll(
-            'article, main, [itemprop="articleBody"], #article_body, #maincontent, ' +
+            'article, main, #track, .track, #contentMagazine, .sp-body-content, .sp-detail-content, ' +
+            '[itemprop="articleBody"], #article_body, #maincontent, ' +
             '.detail-content, .afcbc-body, .fck_detail, .the-article-body, ' +
             '.content-detail, .edittor-content, .nd-detail, .cate-24h-foot-arti-deta-info, ' +
-            '.cate-24h-foot-arti-deta-content-main, .singular-content, .cms-body'
+            '.cate-24h-foot-arti-deta-content-main, .singular-content, .cms-body, .entry-content, .post-content'
         );
         const protectedSet = new Set();
         for (const node of articleNodes) {
-            if (node.querySelectorAll('p').length >= 2) {
+            if (node.querySelectorAll('p, section.sec, .sp-detail-content').length >= 1) {
                 let cur = node;
                 while (cur && cur !== document.documentElement) {
                     protectedSet.add(cur);
@@ -636,6 +726,20 @@ async def _cleanup_page(page: Page) -> None:
             if (cs.overflow === 'hidden' || cs.overflowY === 'hidden') {
                 el.style.setProperty('overflow', 'visible', 'important');
                 el.style.setProperty('overflow-y', 'visible', 'important');
+            }
+            // Hiển thị toàn bộ các khối nội dung bị ẩn do hiệu ứng scroll-reveal (opacity: 0 hoặc clip-path: inset)
+            const innerEls = el.querySelectorAll('p, figure, img, h1, h2, h3, h4, blockquote, div, section, span');
+            for (const child of innerEls) {
+                if (child.classList.contains('r')) {
+                    child.classList.add('in');
+                }
+                const ccs = getComputedStyle(child);
+                if (ccs.opacity === '0' && ccs.display !== 'none') {
+                    child.style.setProperty('opacity', '1', 'important');
+                }
+                if (ccs.clipPath && ccs.clipPath.includes('100%')) {
+                    child.style.setProperty('clip-path', 'none', 'important');
+                }
             }
         }
 
@@ -756,6 +860,11 @@ async def _detect_content_bounds(page: Page) -> dict | None:
             // 1. Ưu tiên kiểm tra các selector thân bài báo chuẩn của các báo điện tử Việt Nam
             // (Lưu ý: tuyệt đối loại trừ các class tiện ích flexbox như justify-content-*, align-content-*)
             const prioritySelectors = [
+                '#contentMagazine',
+                '.sp-body-content',
+                '.sp-detail-content',
+                '#track',
+                '.track',
                 '[itemprop="articleBody"]',
                 '#article_body',
                 '.cate-24h-foot-arti-deta-info',
@@ -826,6 +935,10 @@ async def _detect_content_bounds(page: Page) -> dict | None:
                 const idCls = ((el.id || '') + ' ' + String(el.className || '')).toLowerCase();
                 if (
                     el.getAttribute('itemprop') === 'articleBody' ||
+                    idCls.includes('contentmagazine') ||
+                    idCls.includes('sp-body-content') ||
+                    idCls.includes('sp-detail-content') ||
+                    idCls.includes('track') ||
                     idCls.includes('detail-content') ||
                     idCls.includes('afcbc-body') ||
                     idCls.includes('fck_detail') ||
