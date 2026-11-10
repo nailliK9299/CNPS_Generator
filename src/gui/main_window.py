@@ -560,9 +560,13 @@ class CNPSApp(tk.Tk):
     
     async def _async_facebook_login(self):
         """Mở Chromium headed, chờ đăng nhập, lưu storage_state."""
+        import asyncio
         from playwright.async_api import async_playwright
         
         os.makedirs(os.path.dirname(FB_STORAGE_STATE_PATH), exist_ok=True)
+        saved_session = False
+        logged_detected = False
+
         async with async_playwright() as p:
             browser = await launch_browser(p, headless=False)
             context = await browser.new_context(
@@ -574,7 +578,10 @@ class CNPSApp(tk.Tk):
             )
             page = await context.new_page()
             
-            await page.goto("https://www.facebook.com/", wait_until="domcontentloaded", timeout=60_000)
+            try:
+                await page.goto("https://www.facebook.com/", wait_until="domcontentloaded", timeout=60_000)
+            except Exception:
+                pass
             
             self.after(0, lambda: self._log(
                 "ℹ️ Vui lòng đăng nhập Facebook trong cửa sổ trình duyệt vừa mở.\n"
@@ -586,33 +593,55 @@ class CNPSApp(tk.Tk):
                 "Sau khi đăng nhập xong (thấy trang News Feed), đóng trình duyệt lại."
             ))
             
-            # Theo dõi và tự động lưu session ngay khi phát hiện cookie c_user, đồng thời chờ đóng cửa sổ
-            for _ in range(300):  # tối đa 5 phút
-                if page.is_closed():
+            # Theo dõi và tự động lưu session ngay khi phát hiện cookie c_user, đồng thời chờ người dùng đóng cửa sổ.
+            # Tuyệt đối dùng asyncio.sleep thay vì page.wait_for_timeout để khi người dùng bấm X đóng trình duyệt
+            # không bị văng lỗi "Page.wait_for_timeout: Target page, context or browser has been closed".
+            for _ in range(600):  # tối đa 5 phút (600 * 0.5s)
+                if page.is_closed() or not browser.is_connected():
                     break
                 try:
                     cookies = await context.cookies("https://www.facebook.com")
                     if any(c.get("name") == "c_user" for c in cookies):
                         await context.storage_state(path=FB_STORAGE_STATE_PATH)
+                        saved_session = True
+                        if not logged_detected:
+                            logged_detected = True
+                            self.after(0, lambda: self._log(
+                                "✅ Đã nhận diện đăng nhập Facebook và tự động lưu phiên! Bạn có thể đóng cửa sổ trình duyệt."
+                            ))
+                except Exception:
+                    # Trình duyệt hoặc context vừa được người dùng đóng trong lúc đang đọc cookie
+                    if page.is_closed() or not browser.is_connected():
+                        break
+                await asyncio.sleep(0.5)
+            
+            # Thử lưu session lần cuối nếu trình duyệt vẫn còn mở
+            if not page.is_closed() and browser.is_connected():
+                try:
+                    cookies = await context.cookies("https://www.facebook.com")
+                    if any(c.get("name") == "c_user" for c in cookies):
+                        await context.storage_state(path=FB_STORAGE_STATE_PATH)
+                        saved_session = True
                 except Exception:
                     pass
-                await page.wait_for_timeout(1000)
-            
-            # Lưu session lần cuối trước khi đóng hẳn
-            try:
-                await context.storage_state(path=FB_STORAGE_STATE_PATH)
-            except Exception:
-                pass
             try:
                 await browser.close()
             except Exception:
                 pass
         
-        self.after(0, lambda: self._log("✅ Đã lưu session Facebook thành công."))
-        self.after(0, lambda: messagebox.showinfo(
-            "Thành công",
-            f"Đã lưu session Facebook vào:\n{FB_STORAGE_STATE_PATH}"
-        ))
+        if saved_session or os.path.isfile(FB_STORAGE_STATE_PATH):
+            self.after(0, lambda: self._log("✅ Đã lưu session Facebook thành công."))
+            self.after(0, lambda: messagebox.showinfo(
+                "Thành công",
+                f"Đã lưu session Facebook thành công!\n({FB_STORAGE_STATE_PATH})"
+            ))
+        else:
+            self.after(0, lambda: self._log("⚠️ Đã đóng trình duyệt khi chưa hoàn tất đăng nhập Facebook."))
+            self.after(0, lambda: messagebox.showwarning(
+                "Chưa đăng nhập",
+                "Bạn đã đóng trình duyệt trước khi đăng nhập hoàn tất.\n"
+                "Vui lòng bấm 'Đăng nhập Facebook' và đăng nhập vào tới News Feed trước khi đóng trình duyệt."
+            ))
     
     def _start_generate(self):
         """Bắt đầu quy trình tạo CNPS (trên thread riêng)."""
