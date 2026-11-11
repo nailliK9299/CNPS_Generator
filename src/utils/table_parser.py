@@ -13,8 +13,8 @@ from utils.helpers import remove_vietnamese_diacritics
 COLUMN_ALIASES = {
     "hop_dong": ["hợp đồng", "mã hợp đồng", "hop dong", "ma hop dong", "mã hd", "hd"],
     "so_ht": ["số ht", "so ht"],
-    "nhan_hang": ["nhãn", "nhãn hàng", "nhan", "nhan hang", "brand"],
-    "chien_dich": ["chiến dịch", "chien dich", "campaign"],
+    "nhan_hang": ["nhãn", "nhãn hàng", "nhan", "nhan hang", "brand", "thương hiệu", "thuong hieu", "brand name"],
+    "chien_dich": ["chiến dịch", "chien dich", "campaign", "tên chiến dịch", "ten chien dich", "chương trình", "chuong trinh"],
     "noi_dung_khoan_muc": [
         "nội dung quảng cáo", "nội dung", "khoản mục", "noi dung quang cao",
         "noi dung", "khoan muc", "tên bài", "bài viết", "hạng mục",
@@ -294,6 +294,23 @@ def _is_qty(val: str) -> bool:
     return v.isdigit() and 1 <= int(v) <= 999
 
 
+def _is_contract_code_col(vals: list[str]) -> float:
+    """Kiểm tra tỷ lệ giá trị trong cột giống mã hợp đồng (QC..., HT..., HĐ..., mã code không dấu cách)."""
+    if not vals:
+        return 0.0
+    cnt = 0
+    for v in vals:
+        v_s = str(v).strip()
+        if not v_s:
+            continue
+        # Mã hợp đồng: thường bắt đầu bằng QC, HT, HĐ, HD, PO hoặc là mã alphanumeric ngắn (5-25 ký tự, không chứa khoảng trắng)
+        if re.search(r'\b(QC|HT|HĐ|HD|PO)[0-9A-Z/\-_]+', v_s, re.I):
+            cnt += 1
+        elif re.match(r'^[A-Z0-9/\-_]{5,25}$', v_s) and any(c.isdigit() for c in v_s) and any(c.isalpha() for c in v_s):
+            cnt += 1
+    return cnt / len(vals)
+
+
 def parse_rows_without_headers(all_rows: list[list[str]], metadata: dict) -> list[dict]:
     """
     Phân tích thông minh các dòng dữ liệu không chứa tiêu đề (dán từ Clipboard hoặc file không header).
@@ -417,45 +434,48 @@ def parse_rows_without_headers(all_rows: list[list[str]], metadata: dict) -> lis
         text_cols.append(c)
 
     hop_dong_col = None
+    so_ht_col = None
     nhan_hang_col = None
     chien_dich_col = None
     noi_dung_col = None
 
     if text_cols:
-        if date_col is not None and (date_col - 1) in text_cols:
-            noi_dung_col = date_col - 1
-        elif 5 in text_cols:
-            noi_dung_col = 5
-        elif 4 in text_cols and stt_col is None:
-            noi_dung_col = 4
-        else:
-            noi_dung_col = max(text_cols, key=lambda c: col_info[c]["avg_len"])
+        # 1. Nhận diện các cột mã Hợp đồng / Số HT dựa trên format code (QC..., HT..., HĐ...)
+        contract_scores = {}
+        for c in text_cols:
+            score = _is_contract_code_col(col_info[c].get("vals", []))
+            if score >= 0.25:
+                contract_scores[c] = score
 
-        remaining_text_cols = [c for c in text_cols if c != noi_dung_col]
+        sorted_contracts = sorted(contract_scores.keys(), key=lambda c: (contract_scores[c], -c), reverse=True)
+        if sorted_contracts:
+            hop_dong_col = sorted_contracts[0]
+            if len(sorted_contracts) > 1:
+                so_ht_col = sorted_contracts[1]
 
-        if stt_col == 0:
-            if 1 in remaining_text_cols:
-                hop_dong_col = 1
-            if 3 in remaining_text_cols:
-                nhan_hang_col = 3
-            if 4 in remaining_text_cols and noi_dung_col != 4:
-                chien_dich_col = 4
-        elif stt_col is None:
-            if 0 in remaining_text_cols:
-                hop_dong_col = 0
-            if 2 in remaining_text_cols:
-                nhan_hang_col = 2
-            if 3 in remaining_text_cols and noi_dung_col != 3:
-                chien_dich_col = 3
+        # 2. Các cột text thông thường còn lại (được sắp xếp theo thứ tự cột từ trái sang phải)
+        # Thứ tự logic nghiệp vụ bảng kê luôn là: [Hợp đồng] -> [Số HT] -> [Nhãn hàng] -> [Chiến dịch] -> [Nội dung quảng cáo]
+        assigned_codes = {c for c in [hop_dong_col, so_ht_col] if c is not None}
+        non_code_cols = sorted([c for c in text_cols if c not in assigned_codes])
 
-        unassigned_text = [c for c in remaining_text_cols if c not in {hop_dong_col, nhan_hang_col, chien_dich_col}]
-        for c in unassigned_text:
+        if len(non_code_cols) == 1:
+            noi_dung_col = non_code_cols[0]
+        elif len(non_code_cols) == 2:
+            # Col 0: Nhãn hàng, Col 1: Nội dung quảng cáo
+            nhan_hang_col = non_code_cols[0]
+            noi_dung_col = non_code_cols[1]
+        elif len(non_code_cols) == 3:
+            # Col 0: Nhãn hàng, Col 1: Chiến dịch, Col 2: Nội dung quảng cáo
+            nhan_hang_col = non_code_cols[0]
+            chien_dich_col = non_code_cols[1]
+            noi_dung_col = non_code_cols[2]
+        elif len(non_code_cols) >= 4:
+            # Cột cuối cùng là Nội dung quảng cáo, trước đó là Chiến dịch, trước đó nữa là Nhãn hàng
+            noi_dung_col = non_code_cols[-1]
+            chien_dich_col = non_code_cols[-2]
+            nhan_hang_col = non_code_cols[-3]
             if hop_dong_col is None:
-                hop_dong_col = c
-            elif nhan_hang_col is None:
-                nhan_hang_col = c
-            elif chien_dich_col is None:
-                chien_dich_col = c
+                hop_dong_col = non_code_cols[0]
 
     items = []
     for r in data_rows:

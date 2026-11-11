@@ -251,20 +251,22 @@ class CNPSApp(tk.Tk):
         frame_list.grid(row=3, column=0, sticky="ew", padx=15, pady=6)
         frame_list.columnconfigure(0, weight=1)
         
-        columns = ("stt", "noi_dung", "link", "loai", "dvt", "sl", "ngay")
+        columns = ("stt", "nhan", "chien_dich", "noi_dung", "link", "loai", "dvt", "sl", "ngay")
         self._tree = ttk.Treeview(
             frame_list, columns=columns, show="headings", height=7,
             selectmode="browse"
         )
         
         col_config = [
-            ("stt",      "STT",             45,  "center", False),
-            ("noi_dung", "Nội dung",        250, "w",      True),
-            ("link",     "Link bài",        250, "w",      True),
-            ("loai",     "Loại",            80,  "center", False),
-            ("dvt",      "ĐVT",            60,  "center", False),
-            ("sl",       "SL",             50,  "center", False),
-            ("ngay",     "Ngày đăng",       95,  "center", False),
+            ("stt",        "STT",        40,  "center", False),
+            ("nhan",       "Nhãn hàng",  110, "w",      False),
+            ("chien_dich", "Chiến dịch", 120, "w",      False),
+            ("noi_dung",   "Nội dung",   210, "w",      True),
+            ("link",       "Link bài",   190, "w",      True),
+            ("loai",       "Loại",       70,  "center", False),
+            ("dvt",        "ĐVT",        50,  "center", False),
+            ("sl",         "SL",         40,  "center", False),
+            ("ngay",       "Ngày đăng",  85,  "center", False),
         ]
         for col_id, heading, width, anchor, stretch in col_config:
             self._tree.heading(col_id, text=heading)
@@ -376,6 +378,9 @@ class CNPSApp(tk.Tk):
             return
         
         item = {
+            "nhan_hang": self._ent_nhan.get().strip() if not self._ent_nhan.get().strip().startswith("(") else "",
+            "chien_dich": self._ent_chien_dich.get().strip() if not self._ent_chien_dich.get().strip().startswith("(") else "",
+            "hop_dong": self._ent_hop_dong.get().strip() if not self._ent_hop_dong.get().strip().startswith("(") else "",
             "noi_dung_khoan_muc": noi_dung,
             "link_bai": link,
             "loai": self._cmb_loai.get(),
@@ -388,8 +393,10 @@ class CNPSApp(tk.Tk):
         stt = len(self._items)
         self._tree.insert("", "end", values=(
             stt,
-            noi_dung[:50] + ("..." if len(noi_dung) > 50 else ""),
-            link[:50] + ("..." if len(link) > 50 else ""),
+            item["nhan_hang"],
+            item["chien_dich"],
+            noi_dung[:40] + ("..." if len(noi_dung) > 40 else ""),
+            link[:40] + ("..." if len(link) > 40 else ""),
             item["loai"],
             item["don_vi"],
             item["so_luong"],
@@ -473,27 +480,48 @@ class CNPSApp(tk.Tk):
         if metadata.get("ten_khach_hang") and not self._ent_ten_kh.get().strip():
             self._ent_ten_kh.delete(0, tk.END)
             self._ent_ten_kh.insert(0, metadata["ten_khach_hang"])
-            
-        if metadata.get("nhan_hang") and not self._ent_nhan.get().strip():
-            self._ent_nhan.delete(0, tk.END)
-            self._ent_nhan.insert(0, metadata["nhan_hang"])
-            
-        if metadata.get("chien_dich") and not self._ent_chien_dich.get().strip():
-            self._ent_chien_dich.delete(0, tk.END)
-            self._ent_chien_dich.insert(0, metadata["chien_dich"])
-            
-        # Thêm từ item đầu tiên nếu GUI vẫn trống
-        if items:
-            first = items[0]
-            if first.get("hop_dong") and not self._ent_hop_dong.get().strip():
-                self._ent_hop_dong.delete(0, tk.END)
-                self._ent_hop_dong.insert(0, first["hop_dong"])
-            if first.get("nhan_hang") and not self._ent_nhan.get().strip():
+
+        # Kiểm tra tính đồng nhất của nhãn hàng, chiến dịch, hợp đồng giữa các khoản mục
+        brands = [it.get("nhan_hang", "").strip() for it in items if it.get("nhan_hang", "").strip()]
+        campaigns = [it.get("chien_dich", "").strip() for it in items if it.get("chien_dich", "").strip()]
+        contracts = [it.get("hop_dong", "").strip() for it in items if it.get("hop_dong", "").strip()]
+
+        distinct_brands = list(dict.fromkeys(brands))
+        distinct_campaigns = list(dict.fromkeys(campaigns))
+        distinct_contracts = list(dict.fromkeys(contracts))
+
+        if not self._ent_nhan.get().strip():
+            if metadata.get("nhan_hang"):
                 self._ent_nhan.delete(0, tk.END)
-                self._ent_nhan.insert(0, first["nhan_hang"])
-            if first.get("chien_dich") and not self._ent_chien_dich.get().strip():
+                self._ent_nhan.insert(0, metadata["nhan_hang"])
+            elif len(distinct_brands) == 1:
+                self._ent_nhan.delete(0, tk.END)
+                self._ent_nhan.insert(0, distinct_brands[0])
+            elif len(distinct_brands) > 1:
+                self._ent_nhan.delete(0, tk.END)
+                self._ent_nhan.insert(0, "(Theo từng khoản mục)")
+
+        if not self._ent_chien_dich.get().strip():
+            if metadata.get("chien_dich"):
                 self._ent_chien_dich.delete(0, tk.END)
-                self._ent_chien_dich.insert(0, first["chien_dich"])
+                self._ent_chien_dich.insert(0, metadata["chien_dich"])
+            elif len(distinct_campaigns) == 1:
+                self._ent_chien_dich.delete(0, tk.END)
+                self._ent_chien_dich.insert(0, distinct_campaigns[0])
+            elif len(distinct_campaigns) > 1:
+                self._ent_chien_dich.delete(0, tk.END)
+                self._ent_chien_dich.insert(0, "(Theo từng khoản mục)")
+
+        if not self._ent_hop_dong.get().strip():
+            if metadata.get("hop_dong"):
+                self._ent_hop_dong.delete(0, tk.END)
+                self._ent_hop_dong.insert(0, metadata["hop_dong"])
+            elif len(distinct_contracts) == 1:
+                self._ent_hop_dong.delete(0, tk.END)
+                self._ent_hop_dong.insert(0, distinct_contracts[0])
+            elif len(distinct_contracts) > 1:
+                self._ent_hop_dong.delete(0, tk.END)
+                self._ent_hop_dong.insert(0, "(Theo từng khoản mục)")
         
         count = 0
         for item in items:
@@ -502,8 +530,10 @@ class CNPSApp(tk.Tk):
                 stt = len(self._items)
                 self._tree.insert("", "end", values=(
                     stt,
-                    item["noi_dung_khoan_muc"][:50] + ("..." if len(item["noi_dung_khoan_muc"]) > 50 else ""),
-                    item["link_bai"][:50] + ("..." if len(item["link_bai"]) > 50 else ""),
+                    item.get("nhan_hang", ""),
+                    item.get("chien_dich", ""),
+                    item["noi_dung_khoan_muc"][:40] + ("..." if len(item["noi_dung_khoan_muc"]) > 40 else ""),
+                    item["link_bai"][:40] + ("..." if len(item["link_bai"]) > 40 else ""),
                     item["loai"],
                     item["don_vi"],
                     item["so_luong"],
@@ -658,15 +688,19 @@ class CNPSApp(tk.Tk):
         
         missing = []
         if not ten_kh:
-            missing.append("Tên khách hàng")
+            if not any(it.get("ten_khach_hang") for it in self._items):
+                missing.append("Tên khách hàng")
         if not ten_vt:
             missing.append("Tên viết tắt")
-        if not hop_dong:
-            missing.append("Hợp đồng")
-        if not nhan:
-            missing.append("Nhãn hàng")
-        if not chien_dich:
-            missing.append("Chiến dịch")
+        if not hop_dong or hop_dong.startswith("("):
+            if not all(it.get("hop_dong") for it in self._items):
+                missing.append("Hợp đồng")
+        if not nhan or nhan.startswith("("):
+            if not all(it.get("nhan_hang") for it in self._items):
+                missing.append("Nhãn hàng")
+        if not chien_dich or chien_dich.startswith("("):
+            if not all(it.get("chien_dich") for it in self._items):
+                missing.append("Chiến dịch")
         
         if missing:
             messagebox.showwarning(
@@ -762,16 +796,25 @@ class CNPSApp(tk.Tk):
     @staticmethod
     def _merge_item_data(common_data: dict, item: dict) -> dict:
         """
-        Gộp thông tin chung và thông tin khoản mục, ưu tiên thông tin chung
-        đã nhập trên giao diện và không để chuỗi rỗng từ item ghi đè.
+        Gộp thông tin chung và thông tin khoản mục.
+        Mỗi khoản mục giữ giá trị riêng của nó (hợp đồng, nhãn hàng, chiến dịch, khách hàng...)
+        nếu có trong Bảng kê. Thông tin chung trên giao diện chỉ đóng vai trò dự phòng (fallback)
+        khi khoản mục không có giá trị riêng.
         """
-        merged = {**common_data}
-        for k, v in item.items():
-            if k in ("hop_dong", "nhan_hang", "chien_dich", "ten_khach_hang", "ten_viet_tat"):
-                if not merged.get(k) and v:
-                    merged[k] = v
+        clean_common = {}
+        for k, v in common_data.items():
+            s = str(v).strip() if v is not None else ""
+            if s.startswith("(") and s.endswith(")"):
+                clean_common[k] = ""
             else:
-                merged[k] = v
+                clean_common[k] = s
+
+        merged = {**clean_common}
+        for k, v in item.items():
+            if v is not None and str(v).strip():
+                v_s = str(v).strip()
+                if not (v_s.startswith("(") and v_s.endswith(")")):
+                    merged[k] = v_s
         return merged
 
     def _do_generate(self, common_data: dict):
@@ -798,17 +841,16 @@ class CNPSApp(tk.Tk):
         for i, item in enumerate(self._items):
             idx = i + 1
             noi_dung_short = item["noi_dung_khoan_muc"][:40]
+            data = merged_items[i]
+            base_filename = base_filenames[i]
+            brand_label = f" [{data.get('nhan_hang', '')} - {data.get('chien_dich', '')}]" if data.get("nhan_hang") else ""
             
             # Thư mục tạm cho ảnh screenshot của khoản mục này
             temp_dir = None
             try:
                 self._wait_if_paused_or_cancelled()
-                self.after(0, lambda idx=idx, total=total, s=noi_dung_short:
-                    self._update_status(f"Đang xử lý khoản mục {idx}/{total}: {s}..."))
-
-                # Dữ liệu chung + riêng đã chuẩn hoá
-                data = merged_items[i]
-                base_filename = base_filenames[i]
+                self.after(0, lambda idx=idx, total=total, s=noi_dung_short, b=brand_label:
+                    self._update_status(f"Đang xử lý khoản mục {idx}/{total}{b}: {s}..."))
                 
                 # Tạo đường dẫn file duy nhất (đánh số _01, _02... nếu trùng tên hoặc đã tồn tại)
                 if filename_counts[base_filename] > 1:
