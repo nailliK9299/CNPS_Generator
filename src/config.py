@@ -392,13 +392,18 @@ ins.adsbygoogle,
 iframe[src*="doubleclick"], iframe[src*="googlesyndication"],
 iframe[src*="facebook.com/plugins"], iframe[id*="google_ads"],
 
-/* Popup / Modal / Floating / Cookie (loại trừ html, body, main, article) */
+/* Popup / Modal / Floating / Cookie / Tooltip che tiêu đề (loại trừ html, body, main, article) */
 .popup:not(html):not(body):not(main):not(article),
 .modal:not(html):not(body):not(main):not(article),
 [class*="popup"]:not(html):not(body):not(main):not(article),
 [class*="cookie"]:not(html):not(body):not(main):not(article),
 [class*="gdpr"]:not(html):not(body):not(main):not(article),
 [class*="consent"]:not(html):not(body):not(main):not(article),
+.k14topic-tooltip-wrapper,
+[class*="k14topic-tooltip"],
+[class*="tooltip-wrapper"],
+[class*="hover-card"],
+[class*="popover"]:not(html):not(body):not(main):not(article),
 
 /* Bình luận / Footer trang web (không ẩn footer bài viết) */
 .comment-section, #ykcb-form, .box-comment,

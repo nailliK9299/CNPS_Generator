@@ -346,9 +346,10 @@ async def _capture_article(
             if page.url.endswith("/404") or "not found" in page_title:
                 raise Exception(f"Trang không tồn tại (404): {url}")
 
-            # Kiểm tra bài eMagazine thiết kế cuộn ngang (#track.track) và chuyển viewport sang tỉ lệ dọc
-            # (1080x1150 -> aspect-ratio < 1) để CSS của trang tự động xếp chồng toàn bộ các slide theo chiều dọc
+            # Kiểm tra bài eMagazine thiết kế cuộn ngang (#track.track) hoặc khối trượt sticky (.sc-pin)
+            # để mở phẳng toàn bộ các slide theo chiều dọc và hiển thị đầy đủ nội dung bài viết
             is_emagazine = False
+            has_pin_steps = False
             try:
                 emag_info = await asyncio.wait_for(
                     page.evaluate("""
@@ -359,20 +360,104 @@ async def _capture_article(
                             const cs = getComputedStyle(tr);
                             horizTrack = (cs.display === 'flex' && cs.flexDirection === 'row') || cs.position === 'fixed';
                         }
-                        const isMag = horizTrack || Boolean(
-                            document.querySelector('#contentMagazine, .sp-body-content, .sp-detail-content, .emagazine-content, .magazine-content')
+                        const hasPin = Boolean(document.querySelector('.sc-pin, .sc-steps, .k14-sp-wrapper, section.sec .sc'));
+                        const isMag = horizTrack || hasPin || Boolean(
+                            document.querySelector('#contentMagazine, .sp-body-content, .sp-detail-content, .emagazine-content, .magazine-content, .k14-sp-wrapper')
                         );
-                        return { horizTrack, isMag };
+                        return { horizTrack, hasPin, isMag };
                     }
                     """),
                     timeout=3.0,
                 )
                 is_emagazine = bool(emag_info and emag_info.get("isMag"))
+                has_pin_steps = bool(emag_info and emag_info.get("hasPin"))
                 if emag_info and emag_info.get("horizTrack"):
                     await page.set_viewport_size({"width": VIEWPORT_WIDTH, "height": 1150})
                     await page.wait_for_timeout(600)
             except Exception:
                 pass
+            
+            # Nếu là dạng eMagazine sticky trượt từng slide (.sc-pin / .sc-steps), mở phẳng thành bài viết dọc liền mạch
+            if has_pin_steps:
+                try:
+                    await page.evaluate("""
+                    () => {
+                        const style = document.createElement('style');
+                        style.id = 'cnps-emag-unroll';
+                        style.innerHTML = `
+                            .sc, .sc.ready, .sc.light, section.sec, .k14-sp-wrapper, [class*="sp-wrapper"] {
+                                height: auto !important;
+                                min-height: 0 !important;
+                                max-height: none !important;
+                                position: static !important;
+                            }
+                            .sc-pin {
+                                position: static !important;
+                                height: auto !important;
+                                display: block !important;
+                                transform: none !important;
+                            }
+                            .sc-stage {
+                                display: none !important;
+                            }
+                            .sc-steps {
+                                opacity: 1 !important;
+                                height: auto !important;
+                                display: block !important;
+                                max-width: 800px !important;
+                                margin: 0 auto !important;
+                            }
+                            article.sc-step {
+                                opacity: 1 !important;
+                                display: block !important;
+                                visibility: visible !important;
+                                position: relative !important;
+                                top: auto !important;
+                                left: auto !important;
+                                right: auto !important;
+                                bottom: auto !important;
+                                margin-bottom: 60px !important;
+                                transform: none !important;
+                                height: auto !important;
+                                min-height: 0 !important;
+                            }
+                            article.sc-step figure.sc-m {
+                                display: block !important;
+                                visibility: visible !important;
+                                opacity: 1 !important;
+                                position: static !important;
+                                margin: 0 auto 20px auto !important;
+                                max-width: 100% !important;
+                            }
+                            article.sc-step figure.sc-m img {
+                                display: block !important;
+                                visibility: visible !important;
+                                opacity: 1 !important;
+                                width: 100% !important;
+                                height: auto !important;
+                                max-height: 550px !important;
+                                object-fit: cover !important;
+                            }
+                            article.sc-step .sc-main,
+                            article.sc-step .sc-lab {
+                                display: block !important;
+                                opacity: 1 !important;
+                                visibility: visible !important;
+                                position: static !important;
+                                width: 100% !important;
+                                max-width: 100% !important;
+                            }
+                            .topbar {
+                                position: static !important;
+                            }
+                        `;
+                        if (!document.getElementById('cnps-emag-unroll')) {
+                            document.head.appendChild(style);
+                        }
+                    }
+                    """)
+                except Exception as e:
+                    logger.warning(f"Lỗi khi unroll sticky eMagazine: {e}")
             
             # 2. Kích hoạt sớm ảnh lazy-load & ước lượng đáy bài viết trước khi scroll
             await _wait_control(control_callback)
@@ -385,7 +470,7 @@ async def _capture_article(
             except Exception:
                 initial_bounds = None
 
-            max_allowed_height = 28000 if is_emagazine else 16500
+            max_allowed_height = 35000 if is_emagazine else 16500
             max_scroll_px = (int(initial_bounds["bottom"]) + 1200) if initial_bounds else (14000 if is_emagazine else 7500)
             max_scroll_px = max(3500, min(max_scroll_px, max_allowed_height))
 
@@ -560,6 +645,14 @@ async def _force_lazy_images(page: Page) -> None:
             if (dataSrcset && !img.getAttribute('srcset')) {
                 img.setAttribute('srcset', dataSrcset);
             }
+            // Bỏ qua các ảnh nằm trong tooltip, popover, modal hoặc container bị ẩn cố ý
+            if (img.closest('.k14topic-tooltip-wrapper, [class*="k14topic-tooltip"], [class*="tooltip"], [class*="popover"], [class*="hover-card"], [class*="dropdown-menu"]')) {
+                continue;
+            }
+            const parent = img.parentElement;
+            if (parent && window.getComputedStyle(parent).visibility === 'hidden') {
+                continue;
+            }
             const cs = getComputedStyle(img);
             if (cs.opacity === '0') {
                 img.style.setProperty('opacity', '1', 'important');
@@ -611,8 +704,8 @@ async def _auto_scroll(
     Điều khiển trực tiếp từ Python với giới hạn bước và kiểm tra độ cao để KHÔNG bao giờ
     cuộn vào vùng infinite-scroll dưới chân trang báo (như giadinh.suckhoedoisong.vn).
     """
-    max_cap = 28000 if is_emagazine else 16500
-    max_steps = max(8, min(int(max_scroll_px // SCROLL_STEP_PX) + 6, 75 if is_emagazine else 42))
+    max_cap = 35000 if is_emagazine else 16500
+    max_steps = max(8, min(int(max_scroll_px // SCROLL_STEP_PX) + 6, 95 if is_emagazine else 42))
     last_scroll_y = -1
     try:
         for step_idx in range(max_steps):
@@ -771,6 +864,12 @@ async def _cleanup_page(page: Page) -> None:
                 }
             }
         }
+
+        // 5. Ẩn triệt để các tooltip, popover, hover-card che khuất tiêu đề và văn bản
+        document.querySelectorAll('.k14topic-tooltip-wrapper, [class*="k14topic-tooltip"], [class*="tooltip-wrapper"]').forEach(el => {
+            el.style.setProperty('display', 'none', 'important');
+            el.style.setProperty('visibility', 'hidden', 'important');
+        });
     }
     """)
 
@@ -863,6 +962,7 @@ async def _detect_content_bounds(page: Page) -> dict | None:
                 '#contentMagazine',
                 '.sp-body-content',
                 '.sp-detail-content',
+                '.k14-sp-wrapper',
                 '#track',
                 '.track',
                 '[itemprop="articleBody"]',
@@ -938,6 +1038,7 @@ async def _detect_content_bounds(page: Page) -> dict | None:
                     idCls.includes('contentmagazine') ||
                     idCls.includes('sp-body-content') ||
                     idCls.includes('sp-detail-content') ||
+                    idCls.includes('k14-sp-wrapper') ||
                     idCls.includes('track') ||
                     idCls.includes('detail-content') ||
                     idCls.includes('afcbc-body') ||
