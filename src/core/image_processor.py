@@ -68,13 +68,12 @@ def smart_paginate(
         is_blank = False
         if page_img.height < int(50 * scale):
             is_blank = True
-        elif i > 0:
-            if white_ratio >= 0.992:
-                is_blank = True
-            elif uniform_ratio >= 0.975 and (std_dev < 3.0 or white_ratio >= 0.95):
-                is_blank = True
-            elif white_ratio >= 0.96 and uniform_ratio >= 0.95 and std_dev < 5.0:
-                is_blank = True
+        elif white_ratio >= 0.992:
+            is_blank = True
+        elif uniform_ratio >= 0.975 and (std_dev < 3.0 or white_ratio >= 0.95):
+            is_blank = True
+        elif white_ratio >= 0.96 and uniform_ratio >= 0.95 and std_dev < 5.0:
+            is_blank = True
 
         if is_blank:
             logger.warning(
@@ -146,21 +145,19 @@ def _compute_pixel_whitespace_cuts(
     white_mask = np.all(arr >= bg_threshold, axis=2)
     row_white_ratios = white_mask.mean(axis=1)  # Mảng 1D độ dài img_height
     
-    n_pages = max(1, math.ceil(img_height / max_page_height_px))
-    
     cut_points = [0]
     y_start = 0
     
-    for i in range(1, n_pages):
+    # Lặp chừng nào phần còn lại vẫn lớn hơn 1 trang chuẩn để đảm bảo tuyệt đối không trang nào (kể cả trang cuối) bị lố chiều cao
+    while img_height - y_start > max_page_height_px:
         remaining = img_height - y_start
-        pages_left = n_pages - (i - 1)
+        pages_left = max(2, math.ceil(remaining / max_page_height_px))
         step = math.ceil(remaining / pages_left)
         step = min(step, max_page_height_px)
         
         target_y = y_start + step
         search_start = max(y_start + int(step * 0.65), target_y - int(350 * 3))
-        search_end = min(y_start + max_page_height_px, target_y + int(200 * 3))
-        search_end = min(search_end, img_height - 50)
+        search_end = min(y_start + max_page_height_px, target_y + int(200 * 3), img_height - 50)
         
         best_y = target_y
         best_score = -1.0
@@ -178,6 +175,11 @@ def _compute_pixel_whitespace_cuts(
                 best_score = band_score
                 best_y = y
                 
+        # Giới hạn an toàn: không bao giờ vượt quá max_page_height_px từ y_start
+        best_y = min(best_y, y_start + max_page_height_px)
+        if best_y <= y_start:
+            best_y = y_start + max_page_height_px
+            
         cut_points.append(best_y)
         y_start = best_y
         

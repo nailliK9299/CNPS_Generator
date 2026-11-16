@@ -826,8 +826,13 @@ async def _cleanup_page(page: Page) -> None:
                 el.style.setProperty('overflow-y', 'visible', 'important');
             }
             // Hiển thị toàn bộ các khối nội dung bị ẩn do hiệu ứng scroll-reveal (opacity: 0 hoặc clip-path: inset)
-            const innerEls = el.querySelectorAll('p, figure, img, h1, h2, h3, h4, blockquote, div, section, span');
+            // Lưu ý: Chỉ áp dụng trên các thẻ nội dung (p, h1-h4, figure, img, blockquote),
+            // tuyệt đối KHÔNG can thiệp div/section/overlay vì sẽ làm tối đen toàn bộ lớp nền (vd: Shorthand story trên nhandan.vn)
+            const innerEls = el.querySelectorAll('p, figure, img, h1, h2, h3, h4, blockquote');
             for (const child of innerEls) {
+                if (child.closest('[class*="Overlay"], [class*="overlay"], [class*="backdrop"], [class*="mask"]')) {
+                    continue;
+                }
                 if (child.classList.contains('r')) {
                     child.classList.add('in');
                 }
