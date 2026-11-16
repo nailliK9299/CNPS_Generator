@@ -59,11 +59,26 @@ def smart_paginate(
             fallback_first_crop = page_img
         
         # Kiểm tra trang trống (toàn màu trắng hoặc toàn màu nền đồng nhất không có chữ/ảnh)
+        # Lưu ý: Tuyệt đối không bỏ qua lát cắt đầu tiên (i == 0) vì đây là trang bìa/tiêu đề bài viết
         white_ratio = _calculate_white_ratio(page_img)
         uniform_ratio = _calculate_uniform_row_ratio(page_img)
-        if white_ratio >= 0.992 or uniform_ratio >= 0.975 or (white_ratio >= 0.96 and uniform_ratio >= 0.95) or page_img.height < int(50 * scale):
+        arr_gray = np.array(page_img.convert("L"))
+        std_dev = float(arr_gray.std())
+
+        is_blank = False
+        if page_img.height < int(50 * scale):
+            is_blank = True
+        elif i > 0:
+            if white_ratio >= 0.992:
+                is_blank = True
+            elif uniform_ratio >= 0.975 and (std_dev < 3.0 or white_ratio >= 0.95):
+                is_blank = True
+            elif white_ratio >= 0.96 and uniform_ratio >= 0.95 and std_dev < 5.0:
+                is_blank = True
+
+        if is_blank:
             logger.warning(
-                f"Bỏ qua lát cắt ảnh {i + 1}: white={white_ratio * 100:.0f}%, uniform={uniform_ratio * 100:.0f}%, height={page_img.height}px (trang trống)"
+                f"Bỏ qua lát cắt ảnh {i + 1}: white={white_ratio * 100:.0f}%, uniform={uniform_ratio * 100:.0f}%, std={std_dev:.1f}, height={page_img.height}px (trang trống)"
             )
             continue
             

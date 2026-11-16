@@ -13,6 +13,9 @@ from tkinter import ttk, filedialog, messagebox
 from datetime import datetime
 from pathlib import Path
 
+from PIL import Image
+Image.MAX_IMAGE_PIXELS = None
+
 import sys
 # Thêm thư mục cha vào path để import config
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

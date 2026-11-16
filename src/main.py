@@ -8,6 +8,10 @@ Chạy: python src/main.py
 import os
 import sys
 
+# Tắt giới hạn DecompressionBombError của Pillow cho toàn bộ ứng dụng
+from PIL import Image
+Image.MAX_IMAGE_PIXELS = None
+
 # Đảm bảo src/ nằm trong Python path
 src_dir = os.path.dirname(os.path.abspath(__file__))
 if src_dir not in sys.path:

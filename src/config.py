@@ -7,6 +7,9 @@ import os
 import subprocess
 import sys
 
+from PIL import Image
+Image.MAX_IMAGE_PIXELS = None
+
 # ─── Đường dẫn gốc (khác nhau khi chạy dev vs exe đóng gói) ───
 def get_base_path() -> str:
     """Trả về thư mục gốc của ứng dụng."""
@@ -400,6 +403,10 @@ iframe[src*="facebook.com/plugins"], iframe[id*="google_ads"],
 [class*="gdpr"]:not(html):not(body):not(main):not(article),
 [class*="consent"]:not(html):not(body):not(main):not(article),
 .k14topic-tooltip-wrapper,
+.k14topic-tooltip-content,
+.k14topic-list-news,
+.k14topic-news,
+.k14topic-news-thumb,
 [class*="k14topic-tooltip"],
 [class*="tooltip-wrapper"],
 [class*="hover-card"],

@@ -346,10 +346,12 @@ async def _capture_article(
             if page.url.endswith("/404") or "not found" in page_title:
                 raise Exception(f"Trang không tồn tại (404): {url}")
 
-            # Kiểm tra bài eMagazine thiết kế cuộn ngang (#track.track) hoặc khối trượt sticky (.sc-pin)
-            # để mở phẳng toàn bộ các slide theo chiều dọc và hiển thị đầy đủ nội dung bài viết
+            # Kiểm tra bài eMagazine thiết kế cuộn ngang (#track.track), khối trượt sticky (.sc-pin)
+            # hoặc định dạng Shorthand/Special/Longform để hiển thị đầy đủ và không bị giới hạn chiều cao
             is_emagazine = False
             has_pin_steps = False
+            import re
+            is_special_url = bool(re.search(r"/(special|emagazine|longform|interactive|magazine)/", url, re.I))
             try:
                 emag_info = await asyncio.wait_for(
                     page.evaluate("""
@@ -362,20 +364,20 @@ async def _capture_article(
                         }
                         const hasPin = Boolean(document.querySelector('.sc-pin, .sc-steps, .k14-sp-wrapper, section.sec .sc'));
                         const isMag = horizTrack || hasPin || Boolean(
-                            document.querySelector('#contentMagazine, .sp-body-content, .sp-detail-content, .emagazine-content, .magazine-content, .k14-sp-wrapper')
+                            document.querySelector('#contentMagazine, .sp-body-content, .sp-detail-content, .emagazine-content, .magazine-content, .k14-sp-wrapper, .Theme-Story, .Theme-Section, article.Core--rootElement, [class*="Theme-Story"]')
                         );
                         return { horizTrack, hasPin, isMag };
                     }
                     """),
                     timeout=3.0,
                 )
-                is_emagazine = bool(emag_info and emag_info.get("isMag"))
+                is_emagazine = is_special_url or bool(emag_info and emag_info.get("isMag"))
                 has_pin_steps = bool(emag_info and emag_info.get("hasPin"))
                 if emag_info and emag_info.get("horizTrack"):
                     await page.set_viewport_size({"width": VIEWPORT_WIDTH, "height": 1150})
                     await page.wait_for_timeout(600)
             except Exception:
-                pass
+                is_emagazine = is_special_url
             
             # Nếu là dạng eMagazine sticky trượt từng slide (.sc-pin / .sc-steps), mở phẳng thành bài viết dọc liền mạch
             if has_pin_steps:
@@ -470,7 +472,7 @@ async def _capture_article(
             except Exception:
                 initial_bounds = None
 
-            max_allowed_height = 35000 if is_emagazine else 16500
+            max_allowed_height = 55000 if is_emagazine else 18000
             max_scroll_px = (int(initial_bounds["bottom"]) + 1200) if initial_bounds else (14000 if is_emagazine else 7500)
             max_scroll_px = max(3500, min(max_scroll_px, max_allowed_height))
 
@@ -571,6 +573,9 @@ async def _capture_article(
                 await asyncio.wait_for(
                     page.evaluate(f"""
                     () => {{
+                        // Đảm bảo loại bỏ hoàn toàn các tooltip/flyout che tiêu đề và nội dung bài viết
+                        document.querySelectorAll('.k14topic-tooltip-wrapper, .k14topic-tooltip-content, [class*="k14topic-tooltip"], [class*="tooltip-wrapper"], [class*="hover-card"]').forEach(el => el.remove());
+
                         // Đảm bảo html và body luôn hiển thị đầy đủ chiều cao, không bị giới hạn 900px
                         for (const rootEl of [document.documentElement, document.body]) {{
                             if (!rootEl) continue;
@@ -865,10 +870,9 @@ async def _cleanup_page(page: Page) -> None:
             }
         }
 
-        // 5. Ẩn triệt để các tooltip, popover, hover-card che khuất tiêu đề và văn bản
-        document.querySelectorAll('.k14topic-tooltip-wrapper, [class*="k14topic-tooltip"], [class*="tooltip-wrapper"]').forEach(el => {
-            el.style.setProperty('display', 'none', 'important');
-            el.style.setProperty('visibility', 'hidden', 'important');
+        // 5. Xoá bỏ hoàn toàn các tooltip, popover, hover-card che khuất tiêu đề và văn bản
+        document.querySelectorAll('.k14topic-tooltip-wrapper, .k14topic-tooltip-content, [class*="k14topic-tooltip"], [class*="tooltip-wrapper"], [class*="hover-card"]').forEach(el => {
+            el.remove();
         });
     }
     """)
@@ -965,6 +969,10 @@ async def _detect_content_bounds(page: Page) -> dict | None:
                 '.k14-sp-wrapper',
                 '#track',
                 '.track',
+                '.Theme-Story',
+                'article.Core--rootElement',
+                'main.Theme-Story',
+                '.Theme-SectionContainer',
                 '[itemprop="articleBody"]',
                 '#article_body',
                 '.cate-24h-foot-arti-deta-info',
