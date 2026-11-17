@@ -412,6 +412,28 @@ iframe[src*="facebook.com/plugins"], iframe[id*="google_ads"],
 [class*="hover-card"],
 [class*="popover"]:not(html):not(body):not(main):not(article),
 
+/* TikTok overlays, scroll guide, onboarding prompts, login modals */
+#new-user-guide-overlay,
+[id*="new-user-guide"],
+[class*="DivGuideContainer"],
+[class*="DivInstructionText"],
+[class*="StyledTUXTooltip"],
+.TUXToastProvider-center-outlet,
+[id*="TUXToastProvider"],
+[class*="TUXToast"],
+[class*="TUXTooltip"],
+[data-e2e="user-guide"],
+[class*="guide-overlay"],
+[class*="login-modal"],
+div[class*="DivLoginContainer"],
+div[class*="DivBottomContainer"],
+
+/* Chặn infinite-scroll vô tận nạp thêm các bài báo khác ở chân trang */
+[class*="infinite-scroll"],
+.centil-infinite-scroll,
+.recent_post_wrap,
+.line-sepa,
+
 /* Bình luận / Footer trang web (không ẩn footer bài viết) */
 .comment-section, #ykcb-form, .box-comment,
 .site-footer, .page-footer, #site-footer, #footer-site

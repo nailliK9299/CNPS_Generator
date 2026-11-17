@@ -574,7 +574,7 @@ async def _capture_article(
                     page.evaluate(f"""
                     () => {{
                         // Đảm bảo loại bỏ hoàn toàn các tooltip/flyout che tiêu đề và nội dung bài viết
-                        document.querySelectorAll('.k14topic-tooltip-wrapper, .k14topic-tooltip-content, [class*="k14topic-tooltip"], [class*="tooltip-wrapper"], [class*="hover-card"]').forEach(el => el.remove());
+                        document.querySelectorAll('.k14topic-tooltip-wrapper, .k14topic-tooltip-content, [class*="k14topic-tooltip"], [class*="tooltip-wrapper"], [class*="hover-card"], #new-user-guide-overlay, [id*="new-user-guide"], [class*="DivGuideContainer"], [class*="DivInstructionText"], [class*="StyledTUXTooltip"], [id*="TUXToastProvider"], [class*="TUXTooltip"], [data-e2e="user-guide"]').forEach(el => el.remove());
 
                         // Đảm bảo html và body luôn hiển thị đầy đủ chiều cao, không bị giới hạn 900px
                         for (const rootEl of [document.documentElement, document.body]) {{
@@ -879,6 +879,15 @@ async def _cleanup_page(page: Page) -> None:
         document.querySelectorAll('.k14topic-tooltip-wrapper, .k14topic-tooltip-content, [class*="k14topic-tooltip"], [class*="tooltip-wrapper"], [class*="hover-card"]').forEach(el => {
             el.remove();
         });
+
+        // 6. Xoá bỏ hoàn toàn các hướng dẫn scroll và popup của TikTok
+        document.querySelectorAll('#new-user-guide-overlay, [id*="new-user-guide"], [class*="DivGuideContainer"], [class*="DivInstructionText"], [class*="StyledTUXTooltip"], [id*="TUXToastProvider"], [class*="TUXTooltip"], [data-e2e="user-guide"], [class*="guide-overlay"]').forEach(el => {
+            el.remove();
+        });
+        const tiktokCloseBtn = document.querySelector('#new-user-guide-overlay button, [data-e2e="user-guide"] button, [data-e2e="modal-close-inner-button"]');
+        if (tiktokCloseBtn) {
+            try { tiktokCloseBtn.click(); } catch(e) {}
+        }
     }
     """)
 
@@ -978,6 +987,11 @@ async def _detect_content_bounds(page: Page) -> dict | None:
                 'article.Core--rootElement',
                 'main.Theme-Story',
                 '.Theme-SectionContainer',
+                '[data-e2e="browse-video"]',
+                '[data-e2e="video-detail-container"]',
+                'div[class*="DivBrowserModeContainer"]',
+                'div[class*="DivVideoFeed"]',
+                'div[class*="DivFlexCenterContainer"]',
                 '[itemprop="articleBody"]',
                 '#article_body',
                 '.cate-24h-foot-arti-deta-info',
